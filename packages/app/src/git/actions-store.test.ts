@@ -200,6 +200,34 @@ describe("checkout-git-actions-store", () => {
     ).toBe("idle");
   });
 
+  it("still creates the PR for commit-and-create-pr when the post-commit cache refresh fails", async () => {
+    const client = {
+      checkoutCommit: vi.fn(async () => ({})),
+      checkoutPrCreate: vi.fn(async () => ({})),
+    };
+    useSessionStore.setState((state) => ({
+      ...state,
+      sessions: {
+        ...state.sessions,
+        [serverId]: { client } as unknown as (typeof state.sessions)[string],
+      },
+    }));
+    const invalidateQueries = vi
+      .spyOn(appQueryClient, "invalidateQueries")
+      .mockRejectedValueOnce(new Error("refetch failed"));
+
+    await useCheckoutGitActionsStore.getState().commitAndCreatePr({ serverId, cwd });
+
+    expect(client.checkoutPrCreate).toHaveBeenCalledWith(cwd, {});
+    expect(
+      useCheckoutGitActionsStore
+        .getState()
+        .getStatus({ serverId, cwd, actionId: "commit-and-create-pr" }),
+    ).toBe("success");
+
+    invalidateQueries.mockRestore();
+  });
+
   it("surfaces PR-creation errors from commit-and-create-pr after a successful commit", async () => {
     const client = {
       checkoutCommit: vi.fn(async () => ({})),
