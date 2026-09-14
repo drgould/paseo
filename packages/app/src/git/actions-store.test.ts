@@ -143,6 +143,88 @@ describe("checkout-git-actions-store", () => {
     ).toBe("idle");
   });
 
+  it("commits then creates a PR in order for commit-and-create-pr", async () => {
+    const order: string[] = [];
+    const client = {
+      checkoutCommit: vi.fn(async () => {
+        order.push("commit");
+        return {};
+      }),
+      checkoutPrCreate: vi.fn(async () => {
+        order.push("create-pr");
+        return {};
+      }),
+    };
+    useSessionStore.setState((state) => ({
+      ...state,
+      sessions: {
+        ...state.sessions,
+        [serverId]: { client } as unknown as (typeof state.sessions)[string],
+      },
+    }));
+
+    await useCheckoutGitActionsStore.getState().commitAndCreatePr({ serverId, cwd });
+
+    expect(order).toEqual(["commit", "create-pr"]);
+    expect(client.checkoutCommit).toHaveBeenCalledWith(cwd, { addAll: true });
+    expect(client.checkoutPrCreate).toHaveBeenCalledWith(cwd, {});
+    expect(
+      useCheckoutGitActionsStore
+        .getState()
+        .getStatus({ serverId, cwd, actionId: "commit-and-create-pr" }),
+    ).toBe("success");
+  });
+
+  it("does not create a PR when the commit fails for commit-and-create-pr", async () => {
+    const client = {
+      checkoutCommit: vi.fn(async () => ({ error: { message: "nothing to commit" } })),
+      checkoutPrCreate: vi.fn(async () => ({})),
+    };
+    useSessionStore.setState((state) => ({
+      ...state,
+      sessions: {
+        ...state.sessions,
+        [serverId]: { client } as unknown as (typeof state.sessions)[string],
+      },
+    }));
+
+    await expect(
+      useCheckoutGitActionsStore.getState().commitAndCreatePr({ serverId, cwd }),
+    ).rejects.toThrow("nothing to commit");
+
+    expect(client.checkoutPrCreate).not.toHaveBeenCalled();
+    expect(
+      useCheckoutGitActionsStore
+        .getState()
+        .getStatus({ serverId, cwd, actionId: "commit-and-create-pr" }),
+    ).toBe("idle");
+  });
+
+  it("surfaces PR-creation errors from commit-and-create-pr after a successful commit", async () => {
+    const client = {
+      checkoutCommit: vi.fn(async () => ({})),
+      checkoutPrCreate: vi.fn(async () => ({ error: { message: "no forge configured" } })),
+    };
+    useSessionStore.setState((state) => ({
+      ...state,
+      sessions: {
+        ...state.sessions,
+        [serverId]: { client } as unknown as (typeof state.sessions)[string],
+      },
+    }));
+
+    await expect(
+      useCheckoutGitActionsStore.getState().commitAndCreatePr({ serverId, cwd }),
+    ).rejects.toThrow("no forge configured");
+
+    expect(client.checkoutCommit).toHaveBeenCalled();
+    expect(
+      useCheckoutGitActionsStore
+        .getState()
+        .getStatus({ serverId, cwd, actionId: "commit-and-create-pr" }),
+    ).toBe("idle");
+  });
+
   it("refreshes git and GitHub state and reports success", async () => {
     const client = {
       checkoutRefresh: vi.fn(async () => ({ success: true, error: null })),

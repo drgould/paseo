@@ -388,10 +388,15 @@ function getFeatureActionIds(input: BuildGitActionsInput): GitActionId[] {
 }
 
 function canCommitAndCreatePr(input: BuildGitActionsInput): boolean {
+  if (input.runtime["commit-and-create-pr"].status === "pending") {
+    return true;
+  }
   return (
     input.githubFeaturesEnabled &&
-    !input.hasPullRequest &&
-    (input.hasUncommittedChanges || input.runtime["commit-and-create-pr"].status === "pending")
+    input.hasRemote &&
+    input.baseRefAvailable &&
+    input.hasUncommittedChanges &&
+    !input.hasPullRequest
   );
 }
 

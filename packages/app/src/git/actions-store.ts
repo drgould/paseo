@@ -289,6 +289,9 @@ export const useCheckoutGitActionsStore = create<CheckoutGitActionsStoreState>()
         if (commitPayload.error) {
           throw new Error(commitPayload.error.message);
         }
+        // Invalidate now so a later PR-creation failure doesn't leave the diff/status
+        // views showing pre-commit state.
+        await invalidateCheckoutGitQueries(serverId, cwd);
         const prPayload = await client.checkoutPrCreate(cwd, {});
         if (prPayload.error) {
           throw new Error(prPayload.error.message);

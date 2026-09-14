@@ -349,6 +349,12 @@ describe("git-actions-policy", () => {
         (action) => action.id,
       ),
     ).not.toContain("commit-and-create-pr");
+    expect(
+      buildGitActions({ ...dirty, hasRemote: false }).secondary.map((action) => action.id),
+    ).not.toContain("commit-and-create-pr");
+    expect(
+      buildGitActions({ ...dirty, baseRefAvailable: false }).secondary.map((action) => action.id),
+    ).not.toContain("commit-and-create-pr");
   });
 
   it("keeps commit-and-create-pr visible while its own run is still pending, even after the commit clears hasUncommittedChanges", () => {
