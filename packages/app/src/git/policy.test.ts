@@ -63,6 +63,7 @@ function createInput(
     forgeChangeRequestNoun: "PR",
     githubAutoMergeActionsEnabled: true,
     prSetReadyActionEnabled: true,
+    forgeSupportsPrSetReady: true,
     hasPullRequest: false,
     pullRequestUrl: null,
     pullRequestState: null,
@@ -338,6 +339,13 @@ describe("git-actions-policy", () => {
     ).not.toContain("set-pr-ready");
     expect(
       buildGitActions({ ...draft, prSetReadyActionEnabled: false }).secondary.map(
+        (action) => action.id,
+      ),
+    ).not.toContain("set-pr-ready");
+    // A Gitea-family draft: the daemon-wide RPC is served and the PR is a real
+    // draft, but the resolved forge's adapter cannot flip it out of draft.
+    expect(
+      buildGitActions({ ...draft, forgeSupportsPrSetReady: false }).secondary.map(
         (action) => action.id,
       ),
     ).not.toContain("set-pr-ready");

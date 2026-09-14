@@ -704,6 +704,7 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
       forgeChangeRequestNoun: presentation.changeRequestAbbrev,
       githubAutoMergeActionsEnabled,
       prSetReadyActionEnabled,
+      forgeSupportsPrSetReady: presentation.supportsPrSetReady,
       hasPullRequest,
       pullRequestUrl: prStatus?.url ?? null,
       pullRequestState: narrowPullRequestState(prStatus?.state),

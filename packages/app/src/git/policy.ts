@@ -61,6 +61,8 @@ export interface BuildGitActionsInput {
   githubAutoMergeActionsEnabled: boolean;
   /** The host serves checkout.forge.set_ready.*; gates the draft-to-ready action. */
   prSetReadyActionEnabled: boolean;
+  /** The resolved forge's adapter actually supports taking a PR out of draft. */
+  forgeSupportsPrSetReady: boolean;
   hasPullRequest: boolean;
   pullRequestUrl: string | null;
   pullRequestState: "open" | "closed" | null;
@@ -393,6 +395,7 @@ function canSetPrReady(input: BuildGitActionsInput): boolean {
   return (
     input.githubFeaturesEnabled &&
     input.prSetReadyActionEnabled &&
+    input.forgeSupportsPrSetReady &&
     input.hasPullRequest &&
     input.pullRequestState === "open" &&
     input.pullRequestIsDraft &&
