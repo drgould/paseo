@@ -200,7 +200,7 @@ describe("checkout-git-actions-store", () => {
     ).toBe("idle");
   });
 
-  it("still creates the PR for commit-and-create-pr when the post-commit cache refresh fails", async () => {
+  it("does not fail commit-and-create-pr when the post-commit cache refresh fails", async () => {
     const client = {
       checkoutCommit: vi.fn(async () => ({})),
       checkoutPrCreate: vi.fn(async () => ({})),
@@ -251,6 +251,29 @@ describe("checkout-git-actions-store", () => {
         .getState()
         .getStatus({ serverId, cwd, actionId: "commit-and-create-pr" }),
     ).toBe("idle");
+  });
+
+  it("still attempts a cache refresh for commit-and-create-pr even when PR creation fails", async () => {
+    const client = {
+      checkoutCommit: vi.fn(async () => ({})),
+      checkoutPrCreate: vi.fn(async () => ({ error: { message: "no forge configured" } })),
+    };
+    useSessionStore.setState((state) => ({
+      ...state,
+      sessions: {
+        ...state.sessions,
+        [serverId]: { client } as unknown as (typeof state.sessions)[string],
+      },
+    }));
+    const invalidateQueries = vi.spyOn(appQueryClient, "invalidateQueries");
+
+    await expect(
+      useCheckoutGitActionsStore.getState().commitAndCreatePr({ serverId, cwd }),
+    ).rejects.toThrow("no forge configured");
+
+    expect(invalidateQueries).toHaveBeenCalled();
+
+    invalidateQueries.mockRestore();
   });
 
   it("refreshes git and GitHub state and reports success", async () => {
