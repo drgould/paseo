@@ -52,9 +52,12 @@ import {
   pushCurrentBranch,
   listCheckoutCommits,
   getCommitFileDiff,
+  resolveOriginBranchRef,
 } from "../../../utils/checkout-git.js";
 import { runGitCommand } from "../../../utils/run-git-command.js";
 import { expandTilde } from "../../../utils/path.js";
+import { isPaseoOwnedWorktreeCwd } from "../../../utils/worktree.js";
+import { updatePaseoWorktreeBaseRef } from "../../../utils/worktree-metadata.js";
 import type { GitMetadataGenerator } from "./git-metadata-generator.js";
 
 /**
@@ -966,6 +969,9 @@ export class CheckoutSession {
         },
         service,
       );
+      if (msg.baseRef) {
+        await this.pinBaseRefToPullRequestTarget(cwd, msg.baseRef);
+      }
       await this.gitMutation.notifyGitMutation(cwd, "create-pr", { invalidateForge: true });
 
       this.host.emit({
@@ -989,6 +995,36 @@ export class CheckoutSession {
           requestId,
         },
       });
+    }
+  }
+
+  // The PR's real base can differ from what the workspace was branched off (a
+  // stacked PR, a hotfix against a release branch). Pin the stored base to it so the
+  // notifyGitMutation refresh right after this recomputes the comparison base against
+  // it instead of the workspace's original base. Best-effort: a failure here must not
+  // turn an already-successful PR creation into a reported failure.
+  private async pinBaseRefToPullRequestTarget(cwd: string, baseRef: string): Promise<void> {
+    try {
+      const ownership = await isPaseoOwnedWorktreeCwd(cwd, {
+        paseoHome: this.paseoHome,
+        worktreesRoot: this.worktreesRoot,
+      });
+      if (!ownership.allowed || !ownership.worktreePath) {
+        return;
+      }
+      const qualifiedRef = await resolveOriginBranchRef(cwd, baseRef);
+      if (!qualifiedRef) {
+        return;
+      }
+      updatePaseoWorktreeBaseRef(ownership.worktreePath, {
+        baseRefName: baseRef,
+        baseRef: qualifiedRef,
+      });
+    } catch (error) {
+      this.logger.warn(
+        { err: error, cwd, baseRef },
+        "Failed to pin workspace base ref to the created PR's target",
+      );
     }
   }
 

@@ -21,7 +21,11 @@ import {
   type WorktreeConfig,
 } from "./worktree";
 import type { PaseoConfig } from "@getpaseo/protocol/paseo-config-schema";
-import { getPaseoWorktreeMetadataPath, readPaseoWorktreeMetadata } from "./worktree-metadata.js";
+import {
+  getPaseoWorktreeMetadataPath,
+  readPaseoWorktreeMetadata,
+  updatePaseoWorktreeBaseRef,
+} from "./worktree-metadata.js";
 import {
   getCheckoutDiff,
   getCheckoutStatus,
@@ -486,6 +490,120 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
       expect(
         JSON.parse(readFileSync(getPaseoWorktreeMetadataPath(originResult.worktreePath), "utf8")),
       ).toMatchObject({ baseRefName: "main" });
+    });
+
+    it("reports diff/ahead-behind against origin, not a stale local branch, when branched off a bare base name", async () => {
+      const remoteDir = join(tempDir, "remote.git");
+      execFileSync("git", ["init", "--bare", remoteDir]);
+      execFileSync("git", ["remote", "add", "origin", remoteDir], { cwd: repoDir });
+      execFileSync("git", ["push", "-u", "origin", "main"], { cwd: repoDir });
+
+      const result = await createLegacyWorktreeForTest({
+        branchName: "bare-base-feature",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "bare-base-feature",
+        runSetup: false,
+        paseoHome,
+      });
+
+      // Bare-name base refs are not pinned to a commit stream at creation time; only an
+      // explicit ref (refs/heads/..., origin/...) is.
+      expect(
+        JSON.parse(readFileSync(getPaseoWorktreeMetadataPath(result.worktreePath), "utf8")),
+      ).toMatchObject({ baseRefName: "main" });
+      expect(readPaseoWorktreeMetadata(result.worktreePath)?.baseRef).toBeUndefined();
+
+      // Origin advances after the worktree exists.
+      writeFileSync(join(repoDir, "file.txt"), "from-origin\n");
+      execFileSync("git", ["add", "file.txt"], { cwd: repoDir });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", "advance origin main"], {
+        cwd: repoDir,
+      });
+      execFileSync("git", ["push", "origin", "main"], { cwd: repoDir });
+      execFileSync("git", ["fetch", "origin"], { cwd: result.worktreePath });
+
+      const status = await getCheckoutStatus(result.worktreePath, { paseoHome });
+      expect(status.isGit).toBe(true);
+      if (!status.isGit) {
+        return;
+      }
+      expect(status.aheadBehind).toEqual({ ahead: 0, behind: 1 });
+    });
+
+    it("keeps unpushed local commits when branching off a bare base name whose local branch is ahead of origin", async () => {
+      const remoteDir = join(tempDir, "remote.git");
+      execFileSync("git", ["init", "--bare", remoteDir]);
+      execFileSync("git", ["remote", "add", "origin", remoteDir], { cwd: repoDir });
+      execFileSync("git", ["push", "-u", "origin", "main"], { cwd: repoDir });
+
+      // Local main advances with an unpushed commit before the worktree is created.
+      writeFileSync(join(repoDir, "file.txt"), "from-local\n");
+      execFileSync("git", ["add", "file.txt"], { cwd: repoDir });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", "unpushed local commit"], {
+        cwd: repoDir,
+      });
+
+      const result = await createLegacyWorktreeForTest({
+        branchName: "local-ahead-feature",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "local-ahead-feature",
+        runSetup: false,
+        paseoHome,
+      });
+
+      // The worktree is cut from local main, so the unpushed commit is present.
+      expect(readFileSync(join(result.worktreePath, "file.txt"), "utf8")).toBe("from-local\n");
+    });
+
+    it("pins the stored base to a PR's real target", async () => {
+      const result = await createLegacyWorktreeForTest({
+        branchName: "pr-target-feature",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "pr-target-feature",
+        runSetup: false,
+        paseoHome,
+      });
+
+      const updated = updatePaseoWorktreeBaseRef(result.worktreePath, {
+        baseRefName: "release-1.2",
+        baseRef: "refs/remotes/origin/release-1.2",
+      });
+
+      expect(updated).toBe(true);
+      expect(readPaseoWorktreeMetadata(result.worktreePath)).toMatchObject({
+        baseRefName: "release-1.2",
+        baseRef: "refs/remotes/origin/release-1.2",
+      });
+    });
+
+    it("does not update the stored base when nothing changed", async () => {
+      const result = await createLegacyWorktreeForTest({
+        branchName: "pr-target-unchanged",
+        cwd: repoDir,
+        baseBranch: "refs/heads/main",
+        worktreeSlug: "pr-target-unchanged",
+        runSetup: false,
+        paseoHome,
+      });
+
+      const updated = updatePaseoWorktreeBaseRef(result.worktreePath, {
+        baseRefName: "main",
+        baseRef: "refs/heads/main",
+      });
+
+      expect(updated).toBe(false);
+    });
+
+    it("does not update the stored base for a checkout with no Paseo worktree metadata", async () => {
+      const updated = updatePaseoWorktreeBaseRef(repoDir, {
+        baseRefName: "release-1.2",
+        baseRef: "refs/remotes/origin/release-1.2",
+      });
+
+      expect(updated).toBe(false);
     });
 
     it("records the branch name when the base is on a remote other than origin", async () => {

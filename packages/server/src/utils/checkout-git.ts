@@ -1588,6 +1588,35 @@ export async function resolveRepositoryDefaultBranch(
   return null;
 }
 
+// Used only when creating a workspace with no explicit branch typed, to synthesize a
+// qualified ref (so it pins exactly, like any other explicit base) instead of the bare
+// local name resolveRepositoryDefaultBranch prefers for ongoing status/diff/merge.
+// Mirrors the app's own default-base-picker rule (new-workspace-picker-item.ts): prefer
+// the branch's configured git upstream, since branching off the local ref would silently
+// carry unpushed commits into the new workspace. No configured upstream means no opinion —
+// callers fall back to the bare name, same as today.
+export async function resolveBranchUpstreamRef(
+  repoRoot: string,
+  branchName: string,
+  context?: CheckoutContext,
+): Promise<string | null> {
+  const status = await getUpstreamStatus(repoRoot, branchName, context);
+  return status?.ref ?? null;
+}
+
+// Used only right after a PR is created, to pin the workspace's comparison base to
+// the PR's real target instead of whatever base it was created against. Qualifies
+// against origin, matching every other forge-facing assumption in this codebase
+// (defaultResolveRemoteUrl, PR status polling) — not a new assumption here.
+export async function resolveOriginBranchRef(
+  repoRoot: string,
+  branchName: string,
+  context?: CheckoutContext,
+): Promise<string | null> {
+  const qualifiedRef = `refs/remotes/origin/${branchName}`;
+  return (await doesGitRefExist(repoRoot, qualifiedRef, context)) ? qualifiedRef : null;
+}
+
 async function resolveBaseRef(repoRoot: string, context?: CheckoutContext): Promise<string | null> {
   return resolveRepositoryDefaultBranch(repoRoot, context);
 }

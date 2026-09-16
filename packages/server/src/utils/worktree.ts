@@ -1302,33 +1302,43 @@ interface WorktreeSourcePlan {
   };
 }
 
+async function resolveBranchOffSourcePlan(
+  cwd: string,
+  source: Extract<WorktreeSource, { kind: "branch-off" }>,
+  desiredSlug: string,
+): Promise<WorktreeSourcePlan> {
+  const branchName = source.branchName;
+  await validateGitBranchName(cwd, branchName);
+  const normalizedBaseBranch = normalizeRequiredBaseBranch(source.baseBranch);
+  const resolvedBaseBranch = await resolveBaseBranchForWorktree(cwd, source.baseBranch);
+  const branchExists = await localBranchExists(cwd, branchName);
+  const base = branchExists ? branchName : resolvedBaseBranch;
+  const candidateBranch = branchExists ? desiredSlug : branchName;
+  const newBranchName = await resolveUniqueLocalBranchName(cwd, candidateBranch);
+
+  return {
+    branchName: newBranchName,
+    metadataBaseRefName: normalizedBaseBranch,
+    // Pinning a bare name's resolved ref would freeze diff/ahead-behind comparisons to
+    // whichever of local/origin won at creation time. Leaving it unset lets
+    // resolveBestComparisonBaseRef re-prefer origin on every read instead.
+    ...(isExplicitBaseRef(source.baseBranch) ? { metadataBaseRef: resolvedBaseBranch } : {}),
+    changeRequestLookupTarget: createPaseoWorktreeChangeRequestHint({
+      headRef: newBranchName,
+      localBranchName: newBranchName,
+    }),
+    addArguments: ["-b", newBranchName, "--no-track", base],
+  };
+}
+
 async function resolveWorktreeSourcePlan({
   cwd,
   source,
   desiredSlug,
 }: ResolveWorktreeSourcePlanOptions): Promise<WorktreeSourcePlan> {
   switch (source.kind) {
-    case "branch-off": {
-      const branchName = source.branchName;
-      await validateGitBranchName(cwd, branchName);
-      const normalizedBaseBranch = normalizeRequiredBaseBranch(source.baseBranch);
-      const resolvedBaseBranch = await resolveBaseBranchForWorktree(cwd, source.baseBranch);
-      const branchExists = await localBranchExists(cwd, branchName);
-      const base = branchExists ? branchName : resolvedBaseBranch;
-      const candidateBranch = branchExists ? desiredSlug : branchName;
-      const newBranchName = await resolveUniqueLocalBranchName(cwd, candidateBranch);
-
-      return {
-        branchName: newBranchName,
-        metadataBaseRefName: normalizedBaseBranch,
-        metadataBaseRef: resolvedBaseBranch,
-        changeRequestLookupTarget: createPaseoWorktreeChangeRequestHint({
-          headRef: newBranchName,
-          localBranchName: newBranchName,
-        }),
-        addArguments: ["-b", newBranchName, "--no-track", base],
-      };
-    }
+    case "branch-off":
+      return resolveBranchOffSourcePlan(cwd, source, desiredSlug);
     case "checkout-branch": {
       await validateGitBranchName(cwd, source.branchName);
       if (!(await localBranchExists(cwd, source.branchName))) {
@@ -1611,20 +1621,24 @@ function normalizeRequiredBaseBranch(baseBranch: string): string {
   return normalizedBaseBranch;
 }
 
+// A bare display name ("main") is a moving heuristic: which commit it means gets
+// re-decided (origin-preferred) on every diff/ahead-behind read via
+// resolveBestComparisonBaseRef. A qualified ref ("refs/heads/main", "origin/main")
+// names an exact commit stream the caller picked on purpose and must not drift.
+function isExplicitBaseRef(baseBranch: string): boolean {
+  const trimmed = baseBranch.trim();
+  return trimmed.startsWith("refs/") || trimmed.startsWith("origin/");
+}
+
 async function resolveBaseBranchForWorktree(
   cwd: string,
   requestedBaseBranch: string,
 ): Promise<string> {
   const requested = requestedBaseBranch.trim();
   const normalized = normalizeRequiredBaseBranch(requested);
-  let exactRef: string | null = null;
-  if (requested.startsWith("refs/")) {
-    exactRef = requested;
-  } else if (requested.startsWith("origin/")) {
-    exactRef = `refs/remotes/${requested}`;
-  }
 
-  if (exactRef) {
+  if (isExplicitBaseRef(requested)) {
+    const exactRef = requested.startsWith("refs/") ? requested : `refs/remotes/${requested}`;
     try {
       await runGitCommand(["rev-parse", "--verify", exactRef], { cwd });
       return exactRef;

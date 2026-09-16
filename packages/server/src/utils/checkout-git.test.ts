@@ -40,6 +40,8 @@ import {
   pullCurrentBranch,
   pushCurrentBranch,
   resolveBranchCheckout,
+  resolveBranchUpstreamRef,
+  resolveOriginBranchRef,
   resolveRepositoryDefaultBranch,
   parseWorktreeList,
   renameCurrentBranch,
@@ -3628,7 +3630,7 @@ const x = 1;
 
     await expect(
       getCheckoutDiff(worktree.worktreePath, { mode: "base", baseRef: "other" }, { paseoHome }),
-    ).rejects.toThrow("Base ref mismatch: stored refs/heads/main, requested other");
+    ).rejects.toThrow("Base ref mismatch: stored main, requested other");
   });
 
   it("excludes dirty working tree changes from Paseo worktree base diffs", async () => {
@@ -3678,6 +3680,48 @@ const x = 1;
     });
 
     await expect(resolveRepositoryDefaultBranch(repoDir)).resolves.toBe("main");
+  });
+
+  it("resolves a branch's configured upstream ref", async () => {
+    execFileSync("git", ["remote", "add", "upstream", "https://github.com/acme/repo.git"], {
+      cwd: repoDir,
+    });
+    execFileSync("git", ["update-ref", "refs/remotes/upstream/main", "refs/heads/main"], {
+      cwd: repoDir,
+    });
+    execFileSync("git", ["branch", "--set-upstream-to=upstream/main", "main"], { cwd: repoDir });
+
+    await expect(resolveBranchUpstreamRef(repoDir, "main")).resolves.toBe(
+      "refs/remotes/upstream/main",
+    );
+  });
+
+  it("returns null when the branch has a remote-tracking ref but no configured upstream", async () => {
+    execFileSync("git", ["remote", "add", "upstream", "https://github.com/acme/repo.git"], {
+      cwd: repoDir,
+    });
+    execFileSync("git", ["update-ref", "refs/remotes/upstream/main", "refs/heads/main"], {
+      cwd: repoDir,
+    });
+
+    await expect(resolveBranchUpstreamRef(repoDir, "main")).resolves.toBeNull();
+  });
+
+  it("resolves a branch's origin ref when it exists", async () => {
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/repo.git"], {
+      cwd: repoDir,
+    });
+    execFileSync("git", ["update-ref", "refs/remotes/origin/release-1.2", "refs/heads/main"], {
+      cwd: repoDir,
+    });
+
+    await expect(resolveOriginBranchRef(repoDir, "release-1.2")).resolves.toBe(
+      "refs/remotes/origin/release-1.2",
+    );
+  });
+
+  it("returns null when the branch has no matching origin ref", async () => {
+    await expect(resolveOriginBranchRef(repoDir, "release-1.2")).resolves.toBeNull();
   });
 
   it("merges to stored baseRefName when baseRef is not provided", async () => {
