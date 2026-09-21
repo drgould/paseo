@@ -85,6 +85,46 @@ function isActionDisabled(actionsDisabled: boolean, status: CheckoutGitActionSta
   return actionsDisabled || status === "pending";
 }
 
+interface MutationDisabledInput {
+  actionsDisabled: boolean;
+  isCommitAndPushPending: boolean;
+  commitStatus: CheckoutGitActionStatus;
+  pullStatus: CheckoutGitActionStatus;
+  pushStatus: CheckoutGitActionStatus;
+  pullAndPushStatus: CheckoutGitActionStatus;
+  prCreateStatus: CheckoutGitActionStatus;
+  mergeStatus: CheckoutGitActionStatus;
+  mergeFromBaseStatus: CheckoutGitActionStatus;
+}
+
+interface MutationDisabledFlags {
+  commit: boolean;
+  pull: boolean;
+  push: boolean;
+  pullAndPush: boolean;
+  pr: boolean;
+  mergeBranch: boolean;
+  mergeFromBase: boolean;
+}
+
+// commit-and-push spans a commit and a push RPC; while it's pending, these
+// other mutations could race it against the same checkout, so they're
+// disabled for the duration.
+function computeMutationDisabledFlags(input: MutationDisabledInput): MutationDisabledFlags {
+  const { actionsDisabled, isCommitAndPushPending } = input;
+  const disabled = (status: CheckoutGitActionStatus) =>
+    isActionDisabled(actionsDisabled, status) || isCommitAndPushPending;
+  return {
+    commit: disabled(input.commitStatus),
+    pull: disabled(input.pullStatus),
+    push: disabled(input.pushStatus),
+    pullAndPush: disabled(input.pullAndPushStatus),
+    pr: disabled(input.prCreateStatus),
+    mergeBranch: disabled(input.mergeStatus),
+    mergeFromBase: disabled(input.mergeFromBaseStatus),
+  };
+}
+
 function resolveBranchLabel(input: {
   currentBranch: string | null | undefined;
   notGit: boolean;
@@ -411,6 +451,9 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
   const prCreateStatus = useCheckoutGitActionsStore((s) =>
     s.getStatus({ serverId, cwd, actionId: "create-pr" }),
   );
+  const commitAndPushStatus = useCheckoutGitActionsStore((s) =>
+    s.getStatus({ serverId, cwd, actionId: "commit-and-push" }),
+  );
   const mergePrStatuses: Record<CheckoutPrMergeMethod, CheckoutGitActionStatus> = {
     squash: useCheckoutGitActionsStore((s) =>
       s.getStatus({ serverId, cwd, actionId: "merge-pr-squash" }),
@@ -448,6 +491,7 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
   const runPush = useCheckoutGitActionsStore((s) => s.push);
   const runPullAndPush = useCheckoutGitActionsStore((s) => s.pullAndPush);
   const runCreatePr = useCheckoutGitActionsStore((s) => s.createPr);
+  const runCommitAndPush = useCheckoutGitActionsStore((s) => s.commitAndPush);
   const runMergePr = useCheckoutGitActionsStore((s) => s.mergePr);
   const runEnablePrAutoMerge = useCheckoutGitActionsStore((s) => s.enablePrAutoMerge);
   const runDisablePrAutoMerge = useCheckoutGitActionsStore((s) => s.disablePrAutoMerge);
@@ -539,6 +583,17 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     toastActionError,
     toastActionSuccess,
   ]);
+
+  const handleCommitAndPush = useCallback(() => {
+    void runCommitAndPush({ serverId, cwd })
+      .then(() => {
+        toastActionSuccess(t("workspace.git.actions.commitAndPush.success"));
+        return;
+      })
+      .catch((err) => {
+        toastActionError(err, t("workspace.git.actions.toasts.failedCommitAndPush"));
+      });
+  }, [cwd, runCommitAndPush, serverId, t, toastActionError, toastActionSuccess]);
 
   const handleMergePr = useCallback(
     (method: CheckoutPrMergeMethod) => {
@@ -677,6 +732,17 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
   }, [prStatus?.url, handleCreatePr]);
 
   // Build actions
+  const mutationDisabled = computeMutationDisabledFlags({
+    actionsDisabled,
+    isCommitAndPushPending: commitAndPushStatus === "pending",
+    commitStatus,
+    pullStatus,
+    pushStatus,
+    pullAndPushStatus,
+    prCreateStatus,
+    mergeStatus,
+    mergeFromBaseStatus,
+  });
   const gitActionsInput = useMemo<BuildGitActionsInput>(() => {
     const presentation = getForgePresentation(forge);
     return {
@@ -706,31 +772,37 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
       shipDefault,
       runtime: {
         commit: {
-          disabled: isActionDisabled(actionsDisabled, commitStatus),
+          disabled: mutationDisabled.commit,
           status: commitStatus,
           icon: icons.commit,
           handler: handleCommit,
         },
         pull: {
-          disabled: isActionDisabled(actionsDisabled, pullStatus),
+          disabled: mutationDisabled.pull,
           status: pullStatus,
           icon: icons.pull,
           handler: handlePull,
         },
         push: {
-          disabled: isActionDisabled(actionsDisabled, pushStatus),
+          disabled: mutationDisabled.push,
           status: pushStatus,
           icon: icons.push,
           handler: handlePush,
         },
         "pull-and-push": {
-          disabled: isActionDisabled(actionsDisabled, pullAndPushStatus),
+          disabled: mutationDisabled.pullAndPush,
           status: pullAndPushStatus,
           icon: icons.pullAndPush,
           handler: handlePullAndPush,
         },
+        "commit-and-push": {
+          disabled: isActionDisabled(actionsDisabled, commitAndPushStatus),
+          status: commitAndPushStatus,
+          icon: icons.push,
+          handler: handleCommitAndPush,
+        },
         pr: {
-          disabled: isActionDisabled(actionsDisabled, prCreateStatus),
+          disabled: mutationDisabled.pr,
           status: hasPullRequest ? "idle" : prCreateStatus,
           icon: prIcon,
           handler: handlePrAction,
@@ -778,13 +850,13 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
           handler: handleDisablePrAutoMerge,
         },
         "merge-branch": {
-          disabled: isActionDisabled(actionsDisabled, mergeStatus),
+          disabled: mutationDisabled.mergeBranch,
           status: mergeStatus,
           icon: icons.merge,
           handler: handleMergeBranch,
         },
         "merge-from-base": {
-          disabled: isActionDisabled(actionsDisabled, mergeFromBaseStatus),
+          disabled: mutationDisabled.mergeFromBase,
           status: mergeFromBaseStatus,
           icon: icons.mergeFromBase,
           handler: handleMergeFromBase,
@@ -827,6 +899,14 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     pushStatus,
     pullAndPushStatus,
     prCreateStatus,
+    commitAndPushStatus,
+    mutationDisabled.commit,
+    mutationDisabled.pull,
+    mutationDisabled.push,
+    mutationDisabled.pullAndPush,
+    mutationDisabled.pr,
+    mutationDisabled.mergeBranch,
+    mutationDisabled.mergeFromBase,
     mergePrStatuses.squash,
     mergePrStatuses.merge,
     mergePrStatuses.rebase,
@@ -842,6 +922,7 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     handlePull,
     handlePush,
     handlePullAndPush,
+    handleCommitAndPush,
     handlePrAction,
     handleMergePr,
     handleEnablePrAutoMerge,
@@ -947,6 +1028,12 @@ function getTranslatedGitActionLabels(
         label: t("workspace.git.actions.pullAndPush.label"),
         pendingLabel: t("workspace.git.actions.pullAndPush.pending"),
         successLabel: t("workspace.git.actions.pullAndPush.success"),
+      };
+    case "commit-and-push":
+      return {
+        label: t("workspace.git.actions.commitAndPush.label"),
+        pendingLabel: t("workspace.git.actions.commitAndPush.pending"),
+        successLabel: t("workspace.git.actions.commitAndPush.success"),
       };
     case "pr":
       return hasPullRequest
