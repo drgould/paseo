@@ -462,6 +462,19 @@ describe("git-actions-policy", () => {
       }),
     );
     expect(closedPr.secondary.some((action) => action.id === "commit-and-push")).toBe(false);
+
+    const behindOrigin = buildGitActions(
+      createInput({
+        hasRemote: true,
+        isOnBaseBranch: false,
+        hasUncommittedChanges: true,
+        hasPullRequest: true,
+        pullRequestUrl: "https://example.com/pr/456",
+        pullRequestState: "open",
+        behindOfOrigin: 2,
+      }),
+    );
+    expect(behindOrigin.secondary.some((action) => action.id === "commit-and-push")).toBe(false);
   });
 
   it("places commit-and-push directly ahead of the remote actions", () => {
@@ -485,49 +498,30 @@ describe("git-actions-policy", () => {
     ]);
   });
 
-  it("keeps commit-and-push visible while it's pending even if its inputs no longer qualify", () => {
-    const actions = buildGitActions(
-      createInput({
-        hasRemote: true,
-        isOnBaseBranch: false,
-        hasUncommittedChanges: false,
-        hasPullRequest: true,
-        pullRequestUrl: "https://example.com/pr/456",
-        runtime: {
-          ...createInput().runtime,
-          "commit-and-push": {
-            disabled: false,
-            status: "pending",
-            handler: () => undefined,
+  it.each(["pending", "success"] as const)(
+    "keeps commit-and-push visible while its status is %s even if its inputs no longer qualify",
+    (status) => {
+      const actions = buildGitActions(
+        createInput({
+          hasRemote: true,
+          isOnBaseBranch: false,
+          hasUncommittedChanges: false,
+          hasPullRequest: true,
+          pullRequestUrl: "https://example.com/pr/456",
+          runtime: {
+            ...createInput().runtime,
+            "commit-and-push": {
+              disabled: false,
+              status,
+              handler: () => undefined,
+            },
           },
-        },
-      }),
-    );
+        }),
+      );
 
-    expect(actions.secondary.some((action) => action.id === "commit-and-push")).toBe(true);
-  });
-
-  it("keeps commit-and-push visible during its post-success window, not just while pending", () => {
-    const actions = buildGitActions(
-      createInput({
-        hasRemote: true,
-        isOnBaseBranch: false,
-        hasUncommittedChanges: false,
-        hasPullRequest: true,
-        pullRequestUrl: "https://example.com/pr/456",
-        runtime: {
-          ...createInput().runtime,
-          "commit-and-push": {
-            disabled: false,
-            status: "success",
-            handler: () => undefined,
-          },
-        },
-      }),
-    );
-
-    expect(actions.secondary.some((action) => action.id === "commit-and-push")).toBe(true);
-  });
+      expect(actions.secondary.some((action) => action.id === "commit-and-push")).toBe(true);
+    },
+  );
 
   it("hides Git actions for a non-Git workspace", () => {
     const directory = buildGitActions(createInput({ isGit: false }));

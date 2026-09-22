@@ -92,8 +92,24 @@ function isActionDisabled(
   return actionsDisabled || status === "pending" || blockedBy;
 }
 
-function isAnyPending(...statuses: CheckoutGitActionStatus[]): boolean {
-  return statuses.some((status) => status === "pending");
+function isAnyStatusPending(statuses: CheckoutGitActionStatus[]): boolean {
+  return statuses.includes("pending");
+}
+
+// commit-and-push spans a commit and a push RPC. While it's pending, every
+// other mutation on the checkout is disabled (`otherActionsDisabled`); while
+// any of those is pending, commit-and-push is disabled in turn
+// (`isOtherMutationPending`) so neither side can race the other.
+function computeCommitAndPushMutex(input: {
+  actionsDisabled: boolean;
+  commitAndPushStatus: CheckoutGitActionStatus;
+  otherStatuses: CheckoutGitActionStatus[];
+  isArchiving: boolean;
+}): { otherActionsDisabled: boolean; isOtherMutationPending: boolean } {
+  return {
+    otherActionsDisabled: input.actionsDisabled || input.commitAndPushStatus === "pending",
+    isOtherMutationPending: isAnyStatusPending(input.otherStatuses) || input.isArchiving,
+  };
 }
 
 function resolveBranchLabel(input: {
@@ -704,7 +720,27 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
 
   // Build actions
   const isCommitAndPushPending = commitAndPushStatus === "pending";
-  const isCommitOrPushPending = isAnyPending(commitStatus, pushStatus, pullAndPushStatus);
+  const { otherActionsDisabled, isOtherMutationPending } = computeCommitAndPushMutex({
+    actionsDisabled,
+    commitAndPushStatus,
+    otherStatuses: [
+      commitStatus,
+      pullStatus,
+      pushStatus,
+      pullAndPushStatus,
+      prCreateStatus,
+      mergePrStatuses.squash,
+      mergePrStatuses.merge,
+      mergePrStatuses.rebase,
+      enablePrAutoMergeStatuses.squash,
+      enablePrAutoMergeStatuses.merge,
+      enablePrAutoMergeStatuses.rebase,
+      disablePrAutoMergeStatus,
+      mergeStatus,
+      mergeFromBaseStatus,
+    ],
+    isArchiving: archiveController.isArchiving,
+  });
   const gitActionsInput = useMemo<BuildGitActionsInput>(() => {
     const presentation = getForgePresentation(forge);
     return {
@@ -734,119 +770,91 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
       shipDefault,
       runtime: {
         commit: {
-          disabled: isActionDisabled(actionsDisabled, commitStatus, isCommitAndPushPending),
+          disabled: isActionDisabled(otherActionsDisabled, commitStatus),
           status: commitStatus,
           icon: icons.commit,
           handler: handleCommit,
         },
         pull: {
-          disabled: isActionDisabled(actionsDisabled, pullStatus, isCommitAndPushPending),
+          disabled: isActionDisabled(otherActionsDisabled, pullStatus),
           status: pullStatus,
           icon: icons.pull,
           handler: handlePull,
         },
         push: {
-          disabled: isActionDisabled(actionsDisabled, pushStatus, isCommitAndPushPending),
+          disabled: isActionDisabled(otherActionsDisabled, pushStatus),
           status: pushStatus,
           icon: icons.push,
           handler: handlePush,
         },
         "pull-and-push": {
-          disabled: isActionDisabled(actionsDisabled, pullAndPushStatus, isCommitAndPushPending),
+          disabled: isActionDisabled(otherActionsDisabled, pullAndPushStatus),
           status: pullAndPushStatus,
           icon: icons.pullAndPush,
           handler: handlePullAndPush,
         },
         "commit-and-push": {
-          disabled: isActionDisabled(actionsDisabled, commitAndPushStatus, isCommitOrPushPending),
+          disabled: isActionDisabled(actionsDisabled, commitAndPushStatus, isOtherMutationPending),
           status: commitAndPushStatus,
           icon: icons.push,
           handler: handleCommitAndPush,
         },
         pr: {
-          disabled: isActionDisabled(actionsDisabled, prCreateStatus, isCommitAndPushPending),
+          disabled: isActionDisabled(otherActionsDisabled, prCreateStatus),
           status: hasPullRequest ? "idle" : prCreateStatus,
           icon: prIcon,
           handler: handlePrAction,
         },
         "merge-pr-squash": {
-          disabled: isActionDisabled(
-            actionsDisabled,
-            mergePrStatuses.squash,
-            isCommitAndPushPending,
-          ),
+          disabled: isActionDisabled(otherActionsDisabled, mergePrStatuses.squash),
           status: mergePrStatuses.squash,
           icon: prIcon,
           handler: () => handleMergePr("squash"),
         },
         "merge-pr-merge": {
-          disabled: isActionDisabled(
-            actionsDisabled,
-            mergePrStatuses.merge,
-            isCommitAndPushPending,
-          ),
+          disabled: isActionDisabled(otherActionsDisabled, mergePrStatuses.merge),
           status: mergePrStatuses.merge,
           icon: prIcon,
           handler: () => handleMergePr("merge"),
         },
         "merge-pr-rebase": {
-          disabled: isActionDisabled(
-            actionsDisabled,
-            mergePrStatuses.rebase,
-            isCommitAndPushPending,
-          ),
+          disabled: isActionDisabled(otherActionsDisabled, mergePrStatuses.rebase),
           status: mergePrStatuses.rebase,
           icon: prIcon,
           handler: () => handleMergePr("rebase"),
         },
         "enable-pr-auto-merge-squash": {
-          disabled: isActionDisabled(
-            actionsDisabled,
-            enablePrAutoMergeStatuses.squash,
-            isCommitAndPushPending,
-          ),
+          disabled: isActionDisabled(otherActionsDisabled, enablePrAutoMergeStatuses.squash),
           status: enablePrAutoMergeStatuses.squash,
           icon: prIcon,
           handler: () => handleEnablePrAutoMerge("squash"),
         },
         "enable-pr-auto-merge-merge": {
-          disabled: isActionDisabled(
-            actionsDisabled,
-            enablePrAutoMergeStatuses.merge,
-            isCommitAndPushPending,
-          ),
+          disabled: isActionDisabled(otherActionsDisabled, enablePrAutoMergeStatuses.merge),
           status: enablePrAutoMergeStatuses.merge,
           icon: prIcon,
           handler: () => handleEnablePrAutoMerge("merge"),
         },
         "enable-pr-auto-merge-rebase": {
-          disabled: isActionDisabled(
-            actionsDisabled,
-            enablePrAutoMergeStatuses.rebase,
-            isCommitAndPushPending,
-          ),
+          disabled: isActionDisabled(otherActionsDisabled, enablePrAutoMergeStatuses.rebase),
           status: enablePrAutoMergeStatuses.rebase,
           icon: prIcon,
           handler: () => handleEnablePrAutoMerge("rebase"),
         },
         "disable-pr-auto-merge": {
-          disabled: isActionDisabled(
-            actionsDisabled,
-            disablePrAutoMergeStatus,
-            isCommitAndPushPending,
-          ),
+          disabled: isActionDisabled(otherActionsDisabled, disablePrAutoMergeStatus),
           status: disablePrAutoMergeStatus,
           icon: prIcon,
           handler: handleDisablePrAutoMerge,
         },
         "merge-branch": {
-          disabled: isActionDisabled(actionsDisabled, mergeStatus, isCommitAndPushPending),
+          disabled: isActionDisabled(otherActionsDisabled, mergeStatus),
           status: mergeStatus,
           icon: icons.merge,
           handler: handleMergeBranch,
         },
         "merge-from-base": {
-          disabled: isActionDisabled(actionsDisabled, mergeFromBaseStatus, isCommitAndPushPending),
+          disabled: isActionDisabled(otherActionsDisabled, mergeFromBaseStatus),
           status: mergeFromBaseStatus,
           icon: icons.mergeFromBase,
           handler: handleMergeFromBase,
@@ -894,7 +902,8 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     prCreateStatus,
     commitAndPushStatus,
     isCommitAndPushPending,
-    isCommitOrPushPending,
+    otherActionsDisabled,
+    isOtherMutationPending,
     mergePrStatuses.squash,
     mergePrStatuses.merge,
     mergePrStatuses.rebase,

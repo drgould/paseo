@@ -398,7 +398,8 @@ function canCommitAndPush(input: BuildGitActionsInput): boolean {
     input.hasRemote &&
     input.hasUncommittedChanges &&
     input.hasPullRequest &&
-    input.pullRequestState === "open"
+    input.pullRequestState === "open" &&
+    (input.behindOfOrigin ?? 0) === 0
   );
 }
 
