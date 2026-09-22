@@ -424,6 +424,7 @@ describe("git-actions-policy", () => {
         hasUncommittedChanges: true,
         hasPullRequest: true,
         pullRequestUrl: "https://example.com/pr/456",
+        pullRequestState: "open",
       }),
     );
     expect(withPr.secondary.some((action) => action.id === "commit-and-push")).toBe(true);
@@ -445,9 +446,22 @@ describe("git-actions-policy", () => {
         hasUncommittedChanges: false,
         hasPullRequest: true,
         pullRequestUrl: "https://example.com/pr/456",
+        pullRequestState: "open",
       }),
     );
     expect(clean.secondary.some((action) => action.id === "commit-and-push")).toBe(false);
+
+    const closedPr = buildGitActions(
+      createInput({
+        hasRemote: true,
+        isOnBaseBranch: false,
+        hasUncommittedChanges: true,
+        hasPullRequest: true,
+        pullRequestUrl: "https://example.com/pr/456",
+        pullRequestState: "closed",
+      }),
+    );
+    expect(closedPr.secondary.some((action) => action.id === "commit-and-push")).toBe(false);
   });
 
   it("places commit-and-push directly ahead of the remote actions", () => {
@@ -458,6 +472,7 @@ describe("git-actions-policy", () => {
         hasUncommittedChanges: true,
         hasPullRequest: true,
         pullRequestUrl: "https://example.com/pr/456",
+        pullRequestState: "open",
       }),
     );
 
@@ -483,6 +498,28 @@ describe("git-actions-policy", () => {
           "commit-and-push": {
             disabled: false,
             status: "pending",
+            handler: () => undefined,
+          },
+        },
+      }),
+    );
+
+    expect(actions.secondary.some((action) => action.id === "commit-and-push")).toBe(true);
+  });
+
+  it("keeps commit-and-push visible during its post-success window, not just while pending", () => {
+    const actions = buildGitActions(
+      createInput({
+        hasRemote: true,
+        isOnBaseBranch: false,
+        hasUncommittedChanges: false,
+        hasPullRequest: true,
+        pullRequestUrl: "https://example.com/pr/456",
+        runtime: {
+          ...createInput().runtime,
+          "commit-and-push": {
+            disabled: false,
+            status: "success",
             handler: () => undefined,
           },
         },

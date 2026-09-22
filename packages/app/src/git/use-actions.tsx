@@ -81,48 +81,19 @@ function openURLInNewTab(url: string): void {
   void openExternalUrl(url);
 }
 
-function isActionDisabled(actionsDisabled: boolean, status: CheckoutGitActionStatus): boolean {
-  return actionsDisabled || status === "pending";
+// `blockedBy` lets one in-flight action (e.g. commit-and-push, which spans a
+// commit and a push RPC) hold other mutations on the same checkout disabled
+// for its duration, and vice versa, so they can't race each other.
+function isActionDisabled(
+  actionsDisabled: boolean,
+  status: CheckoutGitActionStatus,
+  blockedBy = false,
+): boolean {
+  return actionsDisabled || status === "pending" || blockedBy;
 }
 
-interface MutationDisabledInput {
-  actionsDisabled: boolean;
-  isCommitAndPushPending: boolean;
-  commitStatus: CheckoutGitActionStatus;
-  pullStatus: CheckoutGitActionStatus;
-  pushStatus: CheckoutGitActionStatus;
-  pullAndPushStatus: CheckoutGitActionStatus;
-  prCreateStatus: CheckoutGitActionStatus;
-  mergeStatus: CheckoutGitActionStatus;
-  mergeFromBaseStatus: CheckoutGitActionStatus;
-}
-
-interface MutationDisabledFlags {
-  commit: boolean;
-  pull: boolean;
-  push: boolean;
-  pullAndPush: boolean;
-  pr: boolean;
-  mergeBranch: boolean;
-  mergeFromBase: boolean;
-}
-
-// commit-and-push spans a commit and a push RPC; while it's pending, these
-// other mutations could race it against the same checkout, so they're
-// disabled for the duration.
-function computeMutationDisabledFlags(input: MutationDisabledInput): MutationDisabledFlags {
-  const { actionsDisabled, isCommitAndPushPending } = input;
-  const disabled = (status: CheckoutGitActionStatus) =>
-    isActionDisabled(actionsDisabled, status) || isCommitAndPushPending;
-  return {
-    commit: disabled(input.commitStatus),
-    pull: disabled(input.pullStatus),
-    push: disabled(input.pushStatus),
-    pullAndPush: disabled(input.pullAndPushStatus),
-    pr: disabled(input.prCreateStatus),
-    mergeBranch: disabled(input.mergeStatus),
-    mergeFromBase: disabled(input.mergeFromBaseStatus),
-  };
+function isAnyPending(...statuses: CheckoutGitActionStatus[]): boolean {
+  return statuses.some((status) => status === "pending");
 }
 
 function resolveBranchLabel(input: {
@@ -732,17 +703,8 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
   }, [prStatus?.url, handleCreatePr]);
 
   // Build actions
-  const mutationDisabled = computeMutationDisabledFlags({
-    actionsDisabled,
-    isCommitAndPushPending: commitAndPushStatus === "pending",
-    commitStatus,
-    pullStatus,
-    pushStatus,
-    pullAndPushStatus,
-    prCreateStatus,
-    mergeStatus,
-    mergeFromBaseStatus,
-  });
+  const isCommitAndPushPending = commitAndPushStatus === "pending";
+  const isCommitOrPushPending = isAnyPending(commitStatus, pushStatus, pullAndPushStatus);
   const gitActionsInput = useMemo<BuildGitActionsInput>(() => {
     const presentation = getForgePresentation(forge);
     return {
@@ -772,97 +734,128 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
       shipDefault,
       runtime: {
         commit: {
-          disabled: mutationDisabled.commit,
+          disabled: isActionDisabled(actionsDisabled, commitStatus, isCommitAndPushPending),
           status: commitStatus,
           icon: icons.commit,
           handler: handleCommit,
         },
         pull: {
-          disabled: mutationDisabled.pull,
+          disabled: isActionDisabled(actionsDisabled, pullStatus, isCommitAndPushPending),
           status: pullStatus,
           icon: icons.pull,
           handler: handlePull,
         },
         push: {
-          disabled: mutationDisabled.push,
+          disabled: isActionDisabled(actionsDisabled, pushStatus, isCommitAndPushPending),
           status: pushStatus,
           icon: icons.push,
           handler: handlePush,
         },
         "pull-and-push": {
-          disabled: mutationDisabled.pullAndPush,
+          disabled: isActionDisabled(actionsDisabled, pullAndPushStatus, isCommitAndPushPending),
           status: pullAndPushStatus,
           icon: icons.pullAndPush,
           handler: handlePullAndPush,
         },
         "commit-and-push": {
-          disabled: isActionDisabled(actionsDisabled, commitAndPushStatus),
+          disabled: isActionDisabled(actionsDisabled, commitAndPushStatus, isCommitOrPushPending),
           status: commitAndPushStatus,
           icon: icons.push,
           handler: handleCommitAndPush,
         },
         pr: {
-          disabled: mutationDisabled.pr,
+          disabled: isActionDisabled(actionsDisabled, prCreateStatus, isCommitAndPushPending),
           status: hasPullRequest ? "idle" : prCreateStatus,
           icon: prIcon,
           handler: handlePrAction,
         },
         "merge-pr-squash": {
-          disabled: isActionDisabled(actionsDisabled, mergePrStatuses.squash),
+          disabled: isActionDisabled(
+            actionsDisabled,
+            mergePrStatuses.squash,
+            isCommitAndPushPending,
+          ),
           status: mergePrStatuses.squash,
           icon: prIcon,
           handler: () => handleMergePr("squash"),
         },
         "merge-pr-merge": {
-          disabled: isActionDisabled(actionsDisabled, mergePrStatuses.merge),
+          disabled: isActionDisabled(
+            actionsDisabled,
+            mergePrStatuses.merge,
+            isCommitAndPushPending,
+          ),
           status: mergePrStatuses.merge,
           icon: prIcon,
           handler: () => handleMergePr("merge"),
         },
         "merge-pr-rebase": {
-          disabled: isActionDisabled(actionsDisabled, mergePrStatuses.rebase),
+          disabled: isActionDisabled(
+            actionsDisabled,
+            mergePrStatuses.rebase,
+            isCommitAndPushPending,
+          ),
           status: mergePrStatuses.rebase,
           icon: prIcon,
           handler: () => handleMergePr("rebase"),
         },
         "enable-pr-auto-merge-squash": {
-          disabled: isActionDisabled(actionsDisabled, enablePrAutoMergeStatuses.squash),
+          disabled: isActionDisabled(
+            actionsDisabled,
+            enablePrAutoMergeStatuses.squash,
+            isCommitAndPushPending,
+          ),
           status: enablePrAutoMergeStatuses.squash,
           icon: prIcon,
           handler: () => handleEnablePrAutoMerge("squash"),
         },
         "enable-pr-auto-merge-merge": {
-          disabled: isActionDisabled(actionsDisabled, enablePrAutoMergeStatuses.merge),
+          disabled: isActionDisabled(
+            actionsDisabled,
+            enablePrAutoMergeStatuses.merge,
+            isCommitAndPushPending,
+          ),
           status: enablePrAutoMergeStatuses.merge,
           icon: prIcon,
           handler: () => handleEnablePrAutoMerge("merge"),
         },
         "enable-pr-auto-merge-rebase": {
-          disabled: isActionDisabled(actionsDisabled, enablePrAutoMergeStatuses.rebase),
+          disabled: isActionDisabled(
+            actionsDisabled,
+            enablePrAutoMergeStatuses.rebase,
+            isCommitAndPushPending,
+          ),
           status: enablePrAutoMergeStatuses.rebase,
           icon: prIcon,
           handler: () => handleEnablePrAutoMerge("rebase"),
         },
         "disable-pr-auto-merge": {
-          disabled: isActionDisabled(actionsDisabled, disablePrAutoMergeStatus),
+          disabled: isActionDisabled(
+            actionsDisabled,
+            disablePrAutoMergeStatus,
+            isCommitAndPushPending,
+          ),
           status: disablePrAutoMergeStatus,
           icon: prIcon,
           handler: handleDisablePrAutoMerge,
         },
         "merge-branch": {
-          disabled: mutationDisabled.mergeBranch,
+          disabled: isActionDisabled(actionsDisabled, mergeStatus, isCommitAndPushPending),
           status: mergeStatus,
           icon: icons.merge,
           handler: handleMergeBranch,
         },
         "merge-from-base": {
-          disabled: mutationDisabled.mergeFromBase,
+          disabled: isActionDisabled(actionsDisabled, mergeFromBaseStatus, isCommitAndPushPending),
           status: mergeFromBaseStatus,
           icon: icons.mergeFromBase,
           handler: handleMergeFromBase,
         },
         "archive-workspace": {
-          disabled: !archiveController.canArchive || archiveController.isArchiving,
+          disabled:
+            !archiveController.canArchive ||
+            archiveController.isArchiving ||
+            isCommitAndPushPending,
           status: archiveController.isArchiving ? "pending" : "idle",
           icon: icons.archive,
           handler: handleArchiveWorkspace,
@@ -900,13 +893,8 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
     pullAndPushStatus,
     prCreateStatus,
     commitAndPushStatus,
-    mutationDisabled.commit,
-    mutationDisabled.pull,
-    mutationDisabled.push,
-    mutationDisabled.pullAndPush,
-    mutationDisabled.pr,
-    mutationDisabled.mergeBranch,
-    mutationDisabled.mergeFromBase,
+    isCommitAndPushPending,
+    isCommitOrPushPending,
     mergePrStatuses.squash,
     mergePrStatuses.merge,
     mergePrStatuses.rebase,

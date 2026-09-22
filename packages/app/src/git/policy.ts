@@ -391,10 +391,15 @@ function getFeatureActionIds(input: BuildGitActionsInput): GitActionId[] {
 }
 
 function canCommitAndPush(input: BuildGitActionsInput): boolean {
-  if (input.runtime["commit-and-push"].status === "pending") {
+  if (input.runtime["commit-and-push"].status !== "idle") {
     return true;
   }
-  return input.hasRemote && input.hasUncommittedChanges && input.hasPullRequest;
+  return (
+    input.hasRemote &&
+    input.hasUncommittedChanges &&
+    input.hasPullRequest &&
+    input.pullRequestState === "open"
+  );
 }
 
 function getDefaultDirectPullRequestMergeActionId(
