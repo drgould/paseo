@@ -8,6 +8,7 @@ import type { Theme } from "@/styles/theme";
 import { getForgePresentation, type Forge } from "@/git/forge";
 import { ForgeBrandIcon, getForgeBrandColorMapping } from "@/git/forge-icon";
 import { type CheckoutGitActionStatus, useCheckoutGitActionsStore } from "@/git/actions-store";
+import { computeCommitAndPushMutex } from "@/git/commit-and-push-mutex";
 import { type CheckoutStatusPayload, useCheckoutStatusQuery } from "@/git/use-status-query";
 import { type CheckoutPrStatusPayload, useCheckoutPrStatusQuery } from "@/git/use-pr-status-query";
 import {
@@ -90,26 +91,6 @@ function isActionDisabled(
   blockedBy = false,
 ): boolean {
   return actionsDisabled || status === "pending" || blockedBy;
-}
-
-function isAnyStatusPending(statuses: CheckoutGitActionStatus[]): boolean {
-  return statuses.includes("pending");
-}
-
-// commit-and-push spans a commit and a push RPC. While it's pending, every
-// other mutation on the checkout is disabled (`otherActionsDisabled`); while
-// any of those is pending, commit-and-push is disabled in turn
-// (`isOtherMutationPending`) so neither side can race the other.
-function computeCommitAndPushMutex(input: {
-  actionsDisabled: boolean;
-  commitAndPushStatus: CheckoutGitActionStatus;
-  otherStatuses: CheckoutGitActionStatus[];
-  isArchiving: boolean;
-}): { otherActionsDisabled: boolean; isOtherMutationPending: boolean } {
-  return {
-    otherActionsDisabled: input.actionsDisabled || input.commitAndPushStatus === "pending",
-    isOtherMutationPending: isAnyStatusPending(input.otherStatuses) || input.isArchiving,
-  };
 }
 
 function resolveBranchLabel(input: {
@@ -794,7 +775,9 @@ export function useGitActions({ serverId, cwd, icons }: UseGitActionsInput): Use
           handler: handlePullAndPush,
         },
         "commit-and-push": {
-          disabled: isActionDisabled(actionsDisabled, commitAndPushStatus, isOtherMutationPending),
+          disabled:
+            isActionDisabled(actionsDisabled, commitAndPushStatus, isOtherMutationPending) ||
+            commitAndPushStatus === "success",
           status: commitAndPushStatus,
           icon: icons.push,
           handler: handleCommitAndPush,
