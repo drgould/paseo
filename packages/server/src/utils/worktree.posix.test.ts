@@ -567,19 +567,18 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
         paseoHome,
       });
 
-      const updated = updatePaseoWorktreeBaseRef(result.worktreePath, {
+      updatePaseoWorktreeBaseRef(result.worktreePath, {
         baseRefName: "release-1.2",
         baseRef: "refs/remotes/origin/release-1.2",
       });
 
-      expect(updated).toBe(true);
       expect(readPaseoWorktreeMetadata(result.worktreePath)).toMatchObject({
         baseRefName: "release-1.2",
         baseRef: "refs/remotes/origin/release-1.2",
       });
     });
 
-    it("does not update the stored base when nothing changed", async () => {
+    it("does not change the stored base when the value is already correct", async () => {
       const result = await createLegacyWorktreeForTest({
         branchName: "pr-target-unchanged",
         cwd: repoDir,
@@ -588,22 +587,23 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
         runSetup: false,
         paseoHome,
       });
+      const before = readPaseoWorktreeMetadata(result.worktreePath);
 
-      const updated = updatePaseoWorktreeBaseRef(result.worktreePath, {
+      updatePaseoWorktreeBaseRef(result.worktreePath, {
         baseRefName: "main",
         baseRef: "refs/heads/main",
       });
 
-      expect(updated).toBe(false);
+      expect(readPaseoWorktreeMetadata(result.worktreePath)).toEqual(before);
     });
 
-    it("does not update the stored base for a checkout with no Paseo worktree metadata", async () => {
-      const updated = updatePaseoWorktreeBaseRef(repoDir, {
+    it("does nothing for a checkout with no Paseo worktree metadata", async () => {
+      updatePaseoWorktreeBaseRef(repoDir, {
         baseRefName: "release-1.2",
         baseRef: "refs/remotes/origin/release-1.2",
       });
 
-      expect(updated).toBe(false);
+      expect(readPaseoWorktreeMetadata(repoDir)).toBeNull();
     });
 
     it("records the branch name when the base is on a remote other than origin", async () => {
@@ -700,9 +700,17 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
       execFileSync("git", ["update-ref", "-d", "refs/remotes/upstream/main"], {
         cwd: result.worktreePath,
       });
-      await expect(
-        getCheckoutDiff(result.worktreePath, { mode: "base", baseRef: "main" }, { paseoHome }),
-      ).rejects.toThrow("Base ref not found: refs/remotes/upstream/main");
+      // The diff view degrades to no-diff instead of throwing when the pinned ref vanishes
+      // (getpaseo/paseo#4968) — a mutating operation like merge below still needs to refuse
+      // outright, since silently merging against the wrong base would be a real bug, but a
+      // read-only comparison should never hard-fail the whole view over a stale ref.
+      expect(
+        await getCheckoutDiff(
+          result.worktreePath,
+          { mode: "base", baseRef: "main" },
+          { paseoHome },
+        ),
+      ).toMatchObject({ diff: "" });
       await expect(
         mergeFromBase(result.worktreePath, { baseRef: "main" }, { paseoHome }),
       ).rejects.toThrow("Base ref not found: refs/remotes/upstream/main");

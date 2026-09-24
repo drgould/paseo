@@ -1822,6 +1822,61 @@ describe("CheckoutSession", () => {
       }
     });
 
+    it("pins to the default resolved base when the caller sends no baseRef at all", async () => {
+      // This is the app's real "Create PR" call shape (checkoutPrCreate(cwd, {})) — no
+      // baseRef, ever. The pin must still fire using whatever base createPullRequest
+      // actually resolved, not silently skip because the raw request omitted one.
+      const { tempDir, repoDir, paseoHome } = createGitRepo();
+      try {
+        const remoteDir = join(tempDir, "remote.git");
+        execFileSync("git", ["init", "--bare", remoteDir], { stdio: "pipe" });
+        execFileSync("git", ["remote", "add", "origin", remoteDir], {
+          cwd: repoDir,
+          stdio: "pipe",
+        });
+        execFileSync("git", ["push", "-u", "origin", "main"], { cwd: repoDir, stdio: "pipe" });
+
+        const worktreePath = await createPaseoWorktree(repoDir, paseoHome);
+        execFileSync("git", ["fetch", "origin"], { cwd: worktreePath, stdio: "pipe" });
+
+        let requestedBase: string | undefined;
+        const github: ForgeService = {
+          ...createGitHubService(),
+          createPullRequest: async ({ base }) => {
+            requestedBase = base;
+            return { url: "https://example.com/pr/1", number: 1 };
+          },
+        };
+        const { checkout, emitted } = makeCheckoutSession({
+          paseoHome,
+          git: {
+            resolveForge: async () => ({ forge: "github", host: "github.com", service: github }),
+          },
+          github,
+        });
+
+        await checkout.handleCheckoutPrCreateRequest({
+          type: "checkout_pr_create_request",
+          cwd: worktreePath,
+          title: "Test PR",
+          body: "Body",
+          requestId: "pr3",
+        });
+
+        expect(emitted[0]).toMatchObject({
+          type: "checkout_pr_create_response",
+          payload: { error: null },
+        });
+        expect(requestedBase).toBe("main");
+        expect(readPaseoWorktreeMetadata(worktreePath)).toMatchObject({
+          baseRefName: "main",
+          baseRef: "refs/remotes/origin/main",
+        });
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
     it("leaves the stored base untouched when the PR's target hasn't been fetched locally", async () => {
       const { tempDir, repoDir, paseoHome } = createGitRepo();
       try {

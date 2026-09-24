@@ -977,9 +977,7 @@ export class CheckoutSession {
         service,
         { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
       );
-      if (msg.baseRef) {
-        await this.pinBaseRefToPullRequestTarget(cwd, msg.baseRef);
-      }
+      await this.pinBaseRefToPullRequestTarget(cwd, result.base);
       await this.gitMutation.notifyGitMutation(cwd, "create-pr", { invalidateForge: true });
 
       this.host.emit({
@@ -1010,7 +1008,12 @@ export class CheckoutSession {
   // stacked PR, a hotfix against a release branch). Pin the stored base to it so the
   // notifyGitMutation refresh right after this recomputes the comparison base against
   // it instead of the workspace's original base. Best-effort: a failure here must not
-  // turn an already-successful PR creation into a reported failure.
+  // turn an already-successful PR creation into a reported failure, so every error is
+  // swallowed and logged rather than selectively rethrown — same tradeoff as
+  // notifyGitMutation (git-mutation-service.ts) for the identical "post-mutation
+  // refresh can't fail the mutation" case. Worst case is a stale comparison base, not
+  // data loss or a broken repo, and getCheckoutSnapshotFacts/getCheckoutDiff already
+  // degrade a stale/missing pinned ref to "no comparison" rather than throwing.
   private async pinBaseRefToPullRequestTarget(cwd: string, baseRef: string): Promise<void> {
     try {
       const ownership = await isPaseoOwnedWorktreeCwd(cwd, {

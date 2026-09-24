@@ -240,27 +240,29 @@ export function writePaseoWorktreeMetadata(
 }
 
 // Called right after a PR is created, to pin the stored base to the PR's real target
-// instead of whatever the workspace was originally branched off. A no-op (false) when
-// there's no existing metadata (not a Paseo-owned worktree) or the value is unchanged,
-// so callers can skip forcing a refresh when nothing actually moved.
+// instead of whatever the workspace was originally branched off. A no-op when there's
+// no existing metadata (not a Paseo-owned worktree) or the value is already correct,
+// so a repeated create-PR call doesn't write the file every time.
 export function updatePaseoWorktreeBaseRef(
   worktreeRoot: string,
   options: { baseRefName: string; baseRef: string },
-): boolean {
+): void {
   const current = readPaseoWorktreeMetadata(worktreeRoot);
   if (!current) {
-    return false;
+    return;
   }
   const baseRefName = normalizeBaseRefName(options.baseRefName);
-  if (current.baseRefName === baseRefName && current.baseRef === options.baseRef) {
-    return false;
+  assertValidBaseRef(baseRefName);
+  const baseRef = options.baseRef.trim();
+  assertValidBaseRef(baseRef);
+  if (current.baseRefName === baseRefName && current.baseRef === baseRef) {
+    return;
   }
   writePaseoWorktreeMetadataFile(worktreeRoot, {
     ...current,
     baseRefName,
-    baseRef: options.baseRef,
+    baseRef,
   });
-  return true;
 }
 
 export function writePaseoWorktreeRuntimeMetadata(
