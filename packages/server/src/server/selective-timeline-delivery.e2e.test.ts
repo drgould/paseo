@@ -6,7 +6,8 @@ import { createPersistedWorkspaceRecord } from "./workspace-registry.js";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
-import { DaemonClient } from "./test-utils/daemon-client.js";
+import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
+import { WebSocket } from "ws";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "./test-utils/paseo-daemon.js";
 import {
   MockLoadTestAgentClient,
@@ -25,7 +26,10 @@ class ConnectedClient {
   private readonly waiters: MessageWaiter[] = [];
   private readonly unsubscribe: () => void;
 
-  constructor(readonly client: DaemonClient) {
+  constructor(
+    readonly client: DaemonClient,
+    private readonly socket: WebSocket,
+  ) {
     this.unsubscribe = client.subscribeRawMessages((message) => {
       this.messages.push(message);
       for (let waiterIndex = this.waiters.length - 1; waiterIndex >= 0; waiterIndex -= 1) {
@@ -36,6 +40,46 @@ class ConnectedClient {
         waiter.resolve(message);
       }
     });
+  }
+
+  // These cases exercise the pre-owned-subscriptions selective timeline contract.
+  async setLegacyTimelineMembership(agentIds: string[]): Promise<void> {
+    const requestId = crypto.randomUUID();
+    this.socket.send(
+      JSON.stringify({
+        type: "session",
+        message: {
+          type: "agent.timeline.set_subscription.request",
+          requestId,
+          agentIds,
+        },
+      }),
+    );
+    await this.next(
+      (message) =>
+        message.type === "agent.timeline.set_subscription.response" &&
+        message.payload.requestId === requestId,
+      "legacy timeline acknowledgement",
+    );
+  }
+
+  async observeLegacyDirectory(subscriptionId: string): Promise<void> {
+    const requestId = crypto.randomUUID();
+    this.socket.send(
+      JSON.stringify({
+        type: "session",
+        message: {
+          type: "fetch_agents_request",
+          requestId,
+          subscribe: { subscriptionId },
+        },
+      }),
+    );
+    await this.next(
+      (message) =>
+        message.type === "fetch_agents_response" && message.payload.requestId === requestId,
+      "legacy directory acknowledgement",
+    );
   }
 
   clear(): void {
@@ -140,28 +184,124 @@ async function connect(input: {
   timelineNotifications?: boolean;
   pluginTimelineItems?: boolean;
   workspaceSetupBlocked?: boolean;
+  ownedSubscriptions?: boolean;
 }): Promise<ConnectedClient> {
+  let socket!: WebSocket;
   const client = new DaemonClient({
     url: `ws://127.0.0.1:${daemon.port}/ws`,
     clientId: input.clientId,
+    webSocketFactory: (url) => {
+      socket = new WebSocket(url);
+      return socket as unknown as WebSocketLike;
+    },
     capabilities: {
+      [CLIENT_CAPS.ownedSubscriptions]: input.ownedSubscriptions ?? false,
       [CLIENT_CAPS.selectiveAgentTimeline]: input.selective,
       [CLIENT_CAPS.pluginTimelineItems]: input.pluginTimelineItems ?? false,
       [CLIENT_CAPS.workspaceSetupBlocked]: input.workspaceSetupBlocked ?? false,
       ...(input.timelineNotifications === undefined
         ? {}
         : { [CLIENT_CAPS.timelineNotifications]: input.timelineNotifications }),
-      ...(input.timelineReplacementInvalidation
-        ? { [CLIENT_CAPS.timelineReplacementInvalidation]: true }
-        : {}),
+      [CLIENT_CAPS.timelineReplacementInvalidation]: input.timelineReplacementInvalidation ?? false,
     },
     reconnect: { enabled: false },
   });
   await client.connect();
-  const connected = new ConnectedClient(client);
+  const connected = new ConnectedClient(client, socket);
   clients.push(connected);
   return connected;
 }
+
+async function startDaemonWithMockAgents(
+  home: { paseoHomeRoot: string; cleanup: boolean } | Record<string, never> = {},
+): Promise<void> {
+  await daemon.close();
+  daemon = await createTestPaseoDaemon({
+    isDev: true,
+    agentClients: { mock: new MockLoadTestAgentClient() },
+    ...home,
+  });
+}
+
+async function connectForFreshness(clientId: string): Promise<ConnectedClient> {
+  return connect({ clientId, selective: true, ownedSubscriptions: true });
+}
+
+async function createChatAtHead(connected: ConnectedClient, title: string) {
+  const agent = await connected.client.createAgent({
+    provider: "mock",
+    cwd: "/tmp",
+    title,
+    model: "ten-second-stream",
+  });
+  await daemon.daemon.agentManager.appendTimelineItem(agent.id, {
+    type: "assistant_message",
+    text: "Already on screen",
+  });
+  const page = await connected.client.fetchAgentTimeline(agent.id, { direction: "tail" });
+  if (!page.endCursor) throw new Error("Expected a timeline cursor");
+  return { agentId: agent.id, head: { epoch: page.endCursor.epoch, seq: page.endCursor.seq } };
+}
+
+test("subscribing with a cursor answers whether each chat is at its head", async () => {
+  await startDaemonWithMockAgents();
+  const connected = await connectForFreshness("freshness-loaded");
+  const atHead = await createChatAtHead(connected, "At head");
+  const staleSeq = await createChatAtHead(connected, "Stale seq");
+  const otherEpoch = await createChatAtHead(connected, "Other epoch");
+  const noCursor = await createChatAtHead(connected, "No cursor");
+
+  const observation = connected.client.observeTimeline(
+    [atHead.agentId, staleSeq.agentId, otherEpoch.agentId, noCursor.agentId],
+    {
+      cursors: {
+        [atHead.agentId]: atHead.head,
+        [staleSeq.agentId]: { ...staleSeq.head, seq: staleSeq.head.seq - 1 },
+        [otherEpoch.agentId]: { ...otherEpoch.head, epoch: "another-epoch" },
+      },
+    },
+  );
+
+  const answer = await observation.ready;
+  expect(answer.timelines).toEqual({
+    [atHead.agentId]: "current",
+    [staleSeq.agentId]: "behind",
+    [otherEpoch.agentId]: "behind",
+  });
+  // Only a current chat skips the fetch that would have delivered its agent row.
+  expect(Object.keys(answer.agents ?? {})).toEqual([atHead.agentId]);
+  expect(answer.agents?.[atHead.agentId]).toMatchObject({ id: atHead.agentId, title: "At head" });
+
+  connected.clear();
+  await daemon.daemon.agentManager.appendTimelineItem(atHead.agentId, {
+    type: "assistant_message",
+    text: "Arrives after the answer",
+  });
+  await connected.next(isAgentStream(atHead.agentId), "live row after a current answer");
+  await observation.release();
+});
+
+test("subscribing with a cursor answers behind for a stored agent and leaves it unloaded", async () => {
+  const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-freshness-"));
+  await startDaemonWithMockAgents({ paseoHomeRoot, cleanup: false });
+  const before = await connectForFreshness("freshness-before-restart");
+  const stored = await createChatAtHead(before, "Stored");
+  before.close();
+  await before.client.close();
+  await startDaemonWithMockAgents({ paseoHomeRoot, cleanup: true });
+  expect(daemon.daemon.agentManager.getAgent(stored.agentId)).toBeNull();
+
+  const connected = await connectForFreshness("freshness-after-restart");
+  const observation = connected.client.observeTimeline([stored.agentId], {
+    cursors: { [stored.agentId]: stored.head },
+  });
+
+  const answer = await observation.ready;
+  expect(answer.timelines).toEqual({ [stored.agentId]: "behind" });
+  expect(answer.agents).toEqual({});
+  expect(daemon.daemon.agentManager.getAgent(stored.agentId)).toBeNull();
+  await observation.release();
+});
 
 test("notification timeline items are sent only to clients that advertise support", async () => {
   await daemon.close();
@@ -358,9 +498,9 @@ test("rewind routes replacement completion by source capability and subscription
   });
 
   await Promise.all([
-    initiating.client.setAgentTimelineSubscription([agent.id]),
-    passive.client.setAgentTimelineSubscription([agent.id]),
-    unrelated.client.setAgentTimelineSubscription([]),
+    initiating.setLegacyTimelineMembership([agent.id]),
+    passive.setLegacyTimelineMembership([agent.id]),
+    unrelated.setLegacyTimelineMembership([]),
   ]);
   await initiating.client.sendMessage(agent.id, "Rewind this synthetic prompt");
   await initiating.client.cancelAgent(agent.id);
@@ -409,7 +549,7 @@ test("subscription acknowledgements stay on the requesting socket of a retained 
   legacy.clear();
   capable.clear();
 
-  await capable.client.setAgentTimelineSubscription(["agent-a"]);
+  await capable.setLegacyTimelineMembership(["agent-a"]);
   await capable.barrier("targeted-subscription-ack");
 
   expect(
@@ -444,7 +584,7 @@ test("real WebSocket sessions enforce selective delivery, retained resets, downg
   await capable.barrier("before-membership");
   expect(capable.hasTimeline(agentC.id)).toBe(false);
 
-  await capable.client.setAgentTimelineSubscription([agentA.id, agentB.id]);
+  await capable.setLegacyTimelineMembership([agentA.id, agentB.id]);
   legacy.clear();
   capable.clear();
   await daemon.daemon.agentManager.emitLiveTimelineItem(agentA.id, {
@@ -467,7 +607,7 @@ test("real WebSocket sessions enforce selective delivery, retained resets, downg
   await capable.barrier("unviewed-c");
   expect(capable.hasTimeline(agentC.id)).toBe(false);
 
-  await capable.client.setAgentTimelineSubscription([agentB.id]);
+  await capable.setLegacyTimelineMembership([agentB.id]);
   legacy.clear();
   capable.clear();
   await daemon.daemon.agentManager.emitLiveTimelineItem(agentA.id, {
@@ -500,8 +640,8 @@ test("real WebSocket sessions enforce selective delivery, retained resets, downg
   expect(capable.hasTimeline(agentB.id)).toBe(false);
 
   await Promise.all([
-    legacy.client.fetchAgents({ subscribe: { subscriptionId: "legacy-directory" } }),
-    capable.client.fetchAgents({ subscribe: { subscriptionId: "capable-directory" } }),
+    legacy.observeLegacyDirectory("legacy-directory"),
+    capable.observeLegacyDirectory("capable-directory"),
   ]);
   capable.client.sendHeartbeat({
     deviceType: "mobile",

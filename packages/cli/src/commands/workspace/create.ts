@@ -1,5 +1,10 @@
+import { isAbsolute as isPosixAbsolute } from "node:path/posix";
+import { isAbsolute as isWindowsAbsolute } from "node:path/win32";
+import { resolve } from "node:path";
 import type { Command } from "commander";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
+import { resolveCallerAgentId } from "../../utils/caller-agent.js";
+import type { DaemonTarget } from "../../utils/daemon-target.js";
 import type { CommandError, CommandOptions, SingleResult } from "../../output/index.js";
 import { toWorkspaceRow, workspaceSchema, type WorkspaceRow } from "./shared.js";
 
@@ -15,6 +20,7 @@ export interface WorkspaceCreateOptions extends CommandOptions {
   branch?: string;
   prNumber?: string;
   forge?: string;
+  background?: boolean;
 }
 
 interface WorktreeSourceBase {
@@ -119,12 +125,26 @@ function buildWorktreeWorkspaceSource(options: WorkspaceCreateOptions, path: str
   }
 }
 
+// A relative --path names a directory relative to where the command runs, so
+// it is made absolute here for a local daemon, which would otherwise resolve
+// it against its own working directory. For an explicit endpoint the path is
+// sent as written, the same rule as resolveRepositoryDirectory. An absolute
+// path can target a daemon on a different operating system, and the daemon
+// expands a leading ~ to its own home directory.
+function resolveCallerPath(input: string, daemonTarget: DaemonTarget): string {
+  const isHomeRelative = input === "~" || input.startsWith("~/");
+  if (isHomeRelative || isPosixAbsolute(input) || isWindowsAbsolute(input)) return input;
+  return daemonTarget.kind === "instance" ? resolve(input) : input;
+}
+
 export function buildWorkspaceSource(options: WorkspaceCreateOptions) {
+  const callerPath =
+    options.path === undefined ? undefined : resolveCallerPath(options.path, options.daemonTarget);
   if (options.isolation === "local") {
-    return buildLocalWorkspaceSource(options, options.path ?? process.cwd());
+    return buildLocalWorkspaceSource(options, callerPath ?? process.cwd());
   }
   if (options.isolation === "worktree") {
-    const sourcePath = options.path ?? (options.project ? undefined : process.cwd());
+    const sourcePath = callerPath ?? (options.project ? undefined : process.cwd());
     return buildWorktreeWorkspaceSource(options, sourcePath);
   }
   throw new Error(`Unsupported workspace isolation: ${String(options.isolation)}`);
@@ -134,8 +154,8 @@ export async function runCreateCommand(
   options: WorkspaceCreateOptions,
   _command: Command,
 ): Promise<SingleResult<WorkspaceRow>> {
-  const host = getDaemonHost({ host: options.host });
-  const client = await connectToDaemon({ host: options.host }).catch((error: unknown) => {
+  const host = getDaemonHost({ target: options.daemonTarget });
+  const client = await connectToDaemon({ target: options.daemonTarget }).catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     throw {
       code: "DAEMON_NOT_RUNNING",
@@ -144,15 +164,19 @@ export async function runCreateCommand(
   });
 
   try {
+    const callerAgentId = await resolveCallerAgentId(client);
     const payload = await client.createWorkspace({
       source: buildWorkspaceSource(options),
       ...(options.title ? { title: options.title } : {}),
+      ...(options.background !== undefined ? { background: options.background } : {}),
+      ...(callerAgentId ? { callerAgentId } : {}),
     });
     if (!payload.workspace) {
       throw new Error(payload.error ?? "Workspace creation failed");
     }
     return { type: "single", data: toWorkspaceRow(payload.workspace), schema: workspaceSchema };
   } catch (error) {
+    if (error && typeof error === "object" && "code" in error) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw { code: "WORKSPACE_CREATE_FAILED", message } satisfies CommandError;
   } finally {

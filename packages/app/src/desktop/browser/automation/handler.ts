@@ -1,3 +1,5 @@
+import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { getDesktopHost, type DesktopHostBridge } from "@/desktop/host";
 import {
@@ -25,6 +27,7 @@ type BrowserAutomationExecuteResponse = Extract<
 type BrowserAutomationResponsePayload = BrowserAutomationExecuteResponse["payload"];
 type BrowserAutomationFailurePayload = Extract<BrowserAutomationResponsePayload, { ok: false }>;
 type BrowserAutomationErrorCode = BrowserAutomationFailurePayload["error"]["code"];
+type BrowserHostRegistration = Parameters<DaemonClient["registerBrowserHost"]>[0];
 
 interface BrowserAutomationClient {
   on(
@@ -68,14 +71,44 @@ export function mountBrowserAutomationHandler(
   };
 }
 
+export function getDesktopBrowserHostRegistration(): BrowserHostRegistration | null {
+  const desktop = getDesktopHost();
+  if (typeof desktop?.browser?.executeAutomationCommand !== "function") return null;
+
+  return {
+    hostKind: "desktop app",
+    label: desktop.browserHostLabel,
+    instanceId: desktop.browserHostInstanceId,
+    supportedCommands: [...BROWSER_AUTOMATION_COMMAND_NAMES],
+  };
+}
+
 export function mountBrowserAutomationDaemonClientHandler(
-  client: unknown,
+  client: DaemonClient,
+  registration: BrowserHostRegistration,
   options?: { serverId?: string },
 ): () => void {
-  return mountBrowserAutomationHandler({
-    client: client as BrowserAutomationClient,
+  const observation = client.registerBrowserHost(registration);
+  const unmount = mountBrowserAutomationHandler({
+    client: {
+      on: (_type, handler) =>
+        observation.subscribe({
+          snapshot: () => {},
+          update: (message) => {
+            if (message.type === "browser.automation.execute.request") handler(message);
+          },
+        }),
+      sendBrowserAutomationExecuteResponse: (response) =>
+        client.sendBrowserAutomationExecuteResponse(response),
+    },
     ...(options?.serverId ? { serverId: options.serverId } : {}),
   });
+  return () => {
+    unmount();
+    void observation
+      .release()
+      .catch((error) => console.warn("Failed to release browser host", error));
+  };
 }
 
 async function handleBrowserAutomationRequest(params: {

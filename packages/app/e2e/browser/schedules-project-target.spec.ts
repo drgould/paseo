@@ -1,10 +1,6 @@
 import { expect, test, type Page } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
-import {
-  addFakeScheduleHostAndReload,
-  buildFakeScheduleHostWorkspace,
-  installFakeScheduleHost,
-} from "../support/helpers/schedule-fake-host";
+import { addScheduleHostAndReload, createScheduleHost } from "../support/helpers/schedule-host";
 import { seedWorkspace, type SeededWorkspace } from "../support/helpers/seed-client";
 import { getServerId } from "../support/helpers/server-id";
 import { projectEquivalenceViewKey } from "../support/helpers/project-view-key";
@@ -242,20 +238,13 @@ test.describe("Schedules project target", () => {
       cadenceExpression: "0 9 * * *",
     });
 
-    const fakeHost = await buildFakeScheduleHostWorkspace(workspace);
-    const fakePort = String(59_000 + Math.floor(Math.random() * 900));
-    await installFakeScheduleHost({
+    const secondary = await createScheduleHost();
+    cleanupTasks.push(() => secondary.cleanup());
+    await addScheduleHostAndReload({
       page,
-      port: fakePort,
-      serverId: fakeHost.serverId,
-      workspace: fakeHost.workspace,
-      project: fakeHost,
-    });
-    await addFakeScheduleHostAndReload({
-      page,
-      serverId: fakeHost.serverId,
-      label: "Fake host",
-      port: fakePort,
+      serverId: secondary.serverId,
+      label: secondary.label,
+      port: secondary.port,
     });
 
     const hostFilterTrigger = page.getByTestId("schedules-host-filter-trigger");
@@ -274,25 +263,17 @@ test.describe("Schedules project target", () => {
     const workspace = await seedWorkspace({ repoPrefix: "schedule-project-host-model-" });
     cleanupTasks.push(() => workspace.cleanup());
     const serverId = getServerId();
-    const fakeHost = await buildFakeScheduleHostWorkspace(workspace);
-    const fakePort = String(59_000 + Math.floor(Math.random() * 900));
-
-    await installFakeScheduleHost({
-      page,
-      port: fakePort,
-      serverId: fakeHost.serverId,
-      workspace: fakeHost.workspace,
-      project: fakeHost,
-    });
+    const secondary = await createScheduleHost();
+    cleanupTasks.push(() => secondary.cleanup());
 
     await gotoAppShell(page);
     await waitForSidebarHydration(page);
     await page.goto(buildSchedulesRoute());
-    await addFakeScheduleHostAndReload({
+    await addScheduleHostAndReload({
       page,
-      serverId: fakeHost.serverId,
-      label: "Fake host",
-      port: fakePort,
+      serverId: secondary.serverId,
+      label: secondary.label,
+      port: secondary.port,
     });
     await expect(page.getByTestId("schedules-empty")).toBeVisible({ timeout: 30_000 });
     await page.getByTestId("schedules-empty-new").click();
@@ -334,8 +315,8 @@ test.describe("Schedules project target", () => {
     await expectSettled(modeTrigger);
 
     await hostTrigger.click();
-    await page.getByTestId(`schedule-host-option-${fakeHost.serverId}`).click();
-    await expect(hostTrigger).toContainText("Fake host");
+    await page.getByTestId(`schedule-host-option-${secondary.serverId}`).click();
+    await expect(hostTrigger).toContainText(secondary.label);
     await expect(projectTrigger).toContainText(/select project/i);
     await expect(modelTrigger).toHaveCount(0);
     await expect(thinkingTrigger).toHaveCount(0);
@@ -345,9 +326,9 @@ test.describe("Schedules project target", () => {
 
     await projectTrigger.click();
     await page
-      .getByTestId(`schedule-project-option-${projectEquivalenceViewKey(fakeHost.projectKey)}`)
+      .getByTestId(`schedule-project-option-${projectEquivalenceViewKey(secondary.projectKey)}`)
       .click();
-    await expect(projectTrigger).toContainText(fakeHost.projectDisplayName);
+    await expect(projectTrigger).toContainText(secondary.projectDisplayName);
     await expectSettled(projectTrigger);
     await expect(modelTrigger).toContainText(/select model/i);
     await expectSettled(modelTrigger);
@@ -355,7 +336,7 @@ test.describe("Schedules project target", () => {
     await expect(modeTrigger).toHaveCount(0);
 
     await page.getByLabel("Schedule name").fill(`Cross host model ${Date.now()}`);
-    await page.getByLabel("Prompt").fill("Run on the fake host project.");
+    await page.getByLabel("Prompt").fill("Run on the secondary host project.");
     await expect(page.getByRole("button", { name: "Create schedule" })).toBeDisabled();
   });
 
@@ -381,7 +362,7 @@ test.describe("Schedules project target", () => {
     ).toHaveCount(0);
     await page.getByTestId("schedule-isolation-trigger").click();
     await page.getByTestId("schedule-isolation-worktree").click();
-    await expect(page.getByTestId("schedule-isolation-trigger")).toContainText("Worktree");
+    await expect(page.getByTestId("schedule-isolation-trigger")).toContainText("New worktree");
     await page.getByTestId("schedule-archive-on-finish-switch").click();
     await page.getByLabel("Schedule name").fill(scheduleName);
     await page.getByLabel("Prompt").fill("Run with custom workspace cleanup.");
@@ -402,7 +383,7 @@ test.describe("Schedules project target", () => {
     const formSheet = page.getByTestId("schedule-form-sheet");
     await expect(formSheet).toBeVisible({ timeout: 10_000 });
     await expectStableHeight(formSheet);
-    await expect(page.getByTestId("schedule-isolation-trigger")).toContainText("Worktree");
+    await expect(page.getByTestId("schedule-isolation-trigger")).toContainText("New worktree");
     await expect(page.getByTestId("schedule-archive-on-finish-switch")).toHaveAttribute(
       "aria-checked",
       "false",

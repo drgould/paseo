@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
+import { connectToDaemon } from "../../utils/client.js";
 import type {
   CommandOptions,
   SingleResult,
@@ -72,6 +72,7 @@ function parseWaitTimeout(timeout: string | undefined): {
       timeoutLabel: `${timeoutSeconds} second${timeoutSeconds === 1 ? "" : "s"}`,
     };
   } catch (err) {
+    if (err && typeof err === "object" && "code" in err) throw err;
     const message = err instanceof Error ? err.message : String(err);
     throw {
       code: "INVALID_TIMEOUT",
@@ -85,7 +86,12 @@ type WaitFinishState = Awaited<
   ReturnType<Awaited<ReturnType<typeof connectToDaemon>>["waitForFinish"]>
 >;
 
-function buildWaitResult(args: {
+/**
+ * Turn the daemon's wait reply into the command result. Throws AGENT_NOT_FOUND when the
+ * daemon resolved no agent: it answers an unknown identifier with an error and no agent
+ * payload, while an agent that finished in error always comes with its payload.
+ */
+export function buildWaitResult(args: {
   state: WaitFinishState;
   resolvedAgentId: string;
   recentActivity: string | null;
@@ -116,6 +122,13 @@ function buildWaitResult(args: {
   }
 
   if (state.status === "error") {
+    if (state.final === null) {
+      throw {
+        code: "AGENT_NOT_FOUND",
+        message: state.error ?? `Agent not found: ${resolvedAgentId}`,
+        details: "Use `paseo ls` to list available agents",
+      } satisfies CommandError;
+    }
     return {
       agentId: resolvedAgentId,
       status: "error",
@@ -142,8 +155,6 @@ export async function runWaitCommand(
   options: AgentWaitOptions,
   _command: Command,
 ): Promise<SingleResult<AgentWaitResult>> {
-  const host = getDaemonHost({ host: options.host });
-
   if (!agentIdArg || agentIdArg.trim().length === 0) {
     throw {
       code: "MISSING_AGENT_ID",
@@ -154,19 +165,9 @@ export async function runWaitCommand(
 
   const { timeoutMs, timeoutLabel } = parseWaitTimeout(options.timeout);
 
-  let client;
-  try {
-    client = await connectToDaemon({ host: options.host });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const error: CommandError = {
-      code: "DAEMON_NOT_RUNNING",
-      message: `Cannot connect to daemon at ${host}: ${message}`,
-      details: "Start the daemon with: paseo daemon start",
-    };
-    throw error;
-  }
+  const client = await connectToDaemon({ target: options.daemonTarget });
 
+  let reply: Omit<Parameters<typeof buildWaitResult>[0], "timeoutLabel">;
   try {
     try {
       const state = await client.waitForFinish(agentIdArg, timeoutMs);
@@ -178,11 +179,7 @@ export async function runWaitCommand(
 
       await client.close();
 
-      return {
-        type: "single",
-        data: buildWaitResult({ state, resolvedAgentId, recentActivity, timeoutLabel }),
-        schema: agentWaitSchema,
-      };
+      reply = { state, resolvedAgentId, recentActivity };
     } catch (waitErr) {
       await client.close().catch(() => {});
 
@@ -210,4 +207,10 @@ export async function runWaitCommand(
     };
     throw error;
   }
+
+  return {
+    type: "single",
+    data: buildWaitResult({ ...reply, timeoutLabel }),
+    schema: agentWaitSchema,
+  };
 }

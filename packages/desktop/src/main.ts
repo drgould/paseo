@@ -1,3 +1,6 @@
+import { protectConsoleStreams } from "./diagnostics/console-streams.js";
+protectConsoleStreams();
+
 process.emitWarning = (() => {}) as typeof process.emitWarning;
 
 import log from "electron-log/main";
@@ -7,6 +10,8 @@ log.initialize({ spyRendererConsole: true });
 import { inheritLoginShellEnv } from "./login-shell-env.js";
 
 import path from "node:path";
+import { randomBytes, randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { pathToFileURL } from "node:url";
 import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -43,6 +48,8 @@ import {
   buildStandardContextMenuItems,
 } from "./window/window-manager.js";
 import { setupDarwinCompositorWatchdog } from "./window/compositor-watchdog/index.js";
+import { reloadWhenRendererExits } from "./window/renderer-recovery.js";
+import { showWindowWhenReady } from "./window/show-when-ready.js";
 import { resolveDesktopWindowChromeMode, windowChromeModeArgument } from "./window/chrome.js";
 import { registerDialogHandlers } from "./features/dialogs.js";
 import {
@@ -330,13 +337,6 @@ if (forcedUserDataDir) {
   }
 }
 
-// AppImage runtimes mount the app from /tmp under the user's UID, so the SUID
-// chrome-sandbox helper we ship in .deb/.rpm cannot work there. Disable the
-// sandbox only in that case; .deb/.rpm keep the sandbox on, matching VS Code.
-if (process.platform === "linux" && process.env.APPIMAGE) {
-  app.commandLine.appendSwitch("no-sandbox");
-}
-
 // Allow users to pass Chromium flags via PASEO_ELECTRON_FLAGS for debugging
 // rendering issues (e.g. "--disable-gpu --ozone-platform=x11").
 // Must run before app.whenReady().
@@ -347,6 +347,16 @@ if (electronFlags) {
     app.commandLine.appendSwitch(key, rest.join("=") || undefined);
   }
   log.info("[electron-flags]", electronFlags);
+}
+
+if (process.platform === "linux") {
+  // Keep the desktop/dock identity independent of the wrapped Electron filename.
+  app.setDesktopName("Paseo.desktop");
+  if (!app.commandLine.hasSwitch("class")) app.commandLine.appendSwitch("class", "Paseo");
+  log.info("[linux-sandbox]", {
+    enabled: !app.commandLine.hasSwitch("no-sandbox"),
+    reason: process.env.PASEO_DESKTOP_SANDBOX_REASON ?? "Chromium default",
+  });
 }
 
 let pendingOpenProjectPath = parseOpenProjectPathFromArgv({
@@ -660,6 +670,14 @@ function getWorkAreasPrimaryFirst(): Electron.Rectangle[] {
   return [primary, ...others].map((display) => display.workArea);
 }
 
+const browserHostComputerName =
+  hostname()
+    .replace(/\.local$/i, "")
+    .trim()
+    .slice(0, 120) || "Desktop";
+const browserHostSessionCode = randomBytes(3).toString("hex").toUpperCase();
+let browserHostWindowNumber = 0;
+
 async function createWindow(
   options: {
     initialRoute?: string | null;
@@ -685,6 +703,7 @@ async function createWindow(
     : null;
 
   const title = devWorktreeName ? `${APP_NAME} (${devWorktreeName})` : APP_NAME;
+  const browserHostLabel = `${browserHostComputerName} · Window ${++browserHostWindowNumber} (${browserHostSessionCode})`;
   const mainWindow = new BrowserWindow({
     title,
     ...resolveWindowBounds(restoredWindowState),
@@ -696,7 +715,11 @@ async function createWindow(
     }),
     webPreferences: {
       preload: getPreloadPath(),
-      additionalArguments: [windowChromeModeArgument(DESKTOP_WINDOW_CHROME_MODE)],
+      additionalArguments: [
+        windowChromeModeArgument(DESKTOP_WINDOW_CHROME_MODE),
+        `--paseo-browser-host-label=${browserHostLabel}`,
+        `--paseo-browser-host-instance-id=${randomUUID()}`,
+      ],
       contextIsolation: true,
       nodeIntegration: false,
       webviewTag: true,
@@ -727,6 +750,7 @@ async function createWindow(
   }
 
   setupDarwinCompositorWatchdog(mainWindow);
+  reloadWhenRendererExits(mainWindow);
   setupWindowResizeEvents(mainWindow);
   if (windowStateStore) {
     setupWindowStatePersistence(mainWindow, windowStateStore);
@@ -770,8 +794,8 @@ async function createWindow(
     registerBrowserWebviewNavigationGuards(contents);
   });
 
-  mainWindow.once("ready-to-show", () => {
-    mainWindow.show();
+  showWindowWhenReady(mainWindow, {
+    showOnLoad: process.platform === "linux",
   });
 
   if (!app.isPackaged) {

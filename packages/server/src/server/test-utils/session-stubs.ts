@@ -1,5 +1,11 @@
+import { createAgentMessageDelivery } from "../agent/agent-messages/index.js";
+import pino from "pino";
 import { randomUUID } from "node:crypto";
-import { vi } from "vitest";
+import { afterEach, vi } from "vitest";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CreationService } from "../creation/index.js";
 
 import { getAgentProviderDefinition } from "@getpaseo/protocol/provider-manifest";
 
@@ -28,13 +34,32 @@ export function asSessionLogger(stub: {
 export function asAgentManager(stub: {
   [K in keyof SessionOptions["agentManager"]]?: unknown;
 }): SessionOptions["agentManager"] {
-  return createStub<SessionOptions["agentManager"]>(stub);
+  return createStub<SessionOptions["agentManager"]>({
+    listProviderSubagentActivity: () => [],
+    getRetiredInternalAgent: () => null,
+    effectiveOptionsFor: (_provider: string, own?: Record<string, unknown>) => own ?? {},
+    getAgentBackgroundWorkSummary: () => undefined,
+    ...stub,
+  });
 }
 
 export function asAgentStorage(stub: {
   [K in keyof SessionOptions["agentStorage"]]?: unknown;
 }): SessionOptions["agentStorage"] {
   return createStub<SessionOptions["agentStorage"]>({
+    listAll: async () => [],
+    listActive: async function (options) {
+      return (await this.listAll()).filter(
+        (record) => options?.includeArchived || !record.archivedAt,
+      );
+    },
+    listByWorkspaces: async function (ids, options) {
+      const selected = new Set(ids);
+      return (await this.listActive(options)).filter((record) =>
+        selected.has(record.workspaceId ?? ""),
+      );
+    },
+    lastUserMessageAtByWorkspace: async () => new Map<string, string>(),
     listByProviderSession: async () => [],
     listByWorkspace: async () => [],
     ...stub,
@@ -213,7 +238,7 @@ export function createProviderSnapshotManagerStub(): {
   const listModes = vi.fn<ProviderSnapshotManager["listModes"]>(async () => []);
   const resolveCreateConfig = vi.fn<ProviderSnapshotManager["resolveCreateConfig"]>(async () => ({
     modeId: undefined,
-    featureValues: undefined,
+    providerOptions: undefined,
   }));
   const resolveDefaultModel = vi.fn<ProviderSnapshotManager["resolveDefaultModel"]>(
     async () => undefined,
@@ -231,6 +256,7 @@ export function createProviderSnapshotManagerStub(): {
   const off = vi.fn();
   const destroy = vi.fn<ProviderSnapshotManager["destroy"]>();
   const stub = {
+    supportsConfigRequiredProvider: () => false,
     getSnapshot,
     refreshSnapshotForCwd,
     refreshSettingsSnapshot,
@@ -278,14 +304,9 @@ export function createProviderSnapshotManagerStub(): {
   };
 }
 
-export function createAgentRequestsStub(): SessionOptions["agentRequests"] {
+export function createMessageReceiptsStub(): SessionOptions["messageReceipts"] {
   return {
-    async create(input) {
-      const agentId = randomUUID();
-      await input.create(agentId);
-      return agentId;
-    },
-    send: (input) => input.send(),
+    send: (input) => input.send(async () => {}),
   };
 }
 
@@ -300,4 +321,30 @@ export function createProviderSnapshot(
       return { entry, contentHash: JSON.stringify(content) };
     }),
   };
+}
+
+const creationDirectories: string[] = [];
+afterEach(async () => {
+  await Promise.all(
+    creationDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+export function createTestCreationService(): SessionOptions["creationService"] {
+  const directory = join(tmpdir(), `session-creation-${randomUUID()}`);
+  creationDirectories.push(directory);
+  return new CreationService(directory, pino({ level: "silent" }));
+}
+
+/** Session fixtures without agent-originated sends still own the delivery lifetime. */
+export function createAgentMessageDeliveryStub(): SessionOptions["agentMessages"] {
+  return createAgentMessageDelivery({
+    dispatch: async () => {
+      throw new Error("Unexpected agent message in session fixture");
+    },
+    onError: (error) => {
+      throw error;
+    },
+  });
 }

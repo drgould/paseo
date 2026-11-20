@@ -12,8 +12,15 @@ import { fileURLToPath } from "node:url";
 import { experimental_createMCPClient } from "ai";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { chromium } from "playwright";
+import { expect } from "@playwright/test";
+import { hideDeveloperToasts } from "../../app/e2e/support/developer-ui.mjs";
 import { runAppearanceFontSizeRegression } from "./appearance-font-size.electron.mjs";
+import { runAdaptiveThemeRegression } from "./appearance-theme.electron.mjs";
+import { runSettingsScrollRegression } from "./settings-scroll.electron.mjs";
+import { buildFillFixture, verifyReactFormFill } from "./browser-fill.electron.mjs";
 import { runSettingsMemoryRegression } from "./settings-memory.electron.mjs";
+
+import { seedPluginLinks, runPluginLinksRegression } from "./plugin-links.electron.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(scriptDir, "..");
@@ -193,12 +200,49 @@ async function waitForDesktopStatus(page) {
   );
 }
 
+async function settleDesktopStartup(page) {
+  await expect(
+    page.getByRole("button", { name: "Desktop browser workspace 1", exact: true }),
+  ).toBeVisible({ timeout: timeoutMs });
+  // The dev launcher supplies its package directory as an open-project request.
+  // Before the local host connects, that request opens the connection prompt.
+  // Finish startup before exercising the unrelated Settings/browser workflows.
+  const connectionPrompt = page.getByTestId("add-host-method-modal");
+  if (await connectionPrompt.isVisible()) {
+    await connectionPrompt.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(connectionPrompt).toBeHidden();
+  }
+}
+
+const CSP_PAGE_PATH = "/csp-no-eval";
+
 async function startTargetPage() {
-  const server = createServer((_request, response) => {
+  const fillFixture = await buildFillFixture();
+  const server = createServer((request, response) => {
+    if (request.url === "/react-fill") {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      response.end(fillFixture);
+      return;
+    }
+    if (request.url === CSP_PAGE_PATH) {
+      response.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy": "default-src 'self'; script-src 'self'",
+      });
+      response.end("<!doctype html><title>CSP page</title><h1>CSP page heading</h1>");
+      return;
+    }
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     response.end(`<!doctype html>
       <html>
-        <head><title>Desktop browser target</title></head>
+        <head><title>Desktop browser target</title>
+          <style>body { min-height: 100vh; background: rgb(255, 0, 0); }</style>
+          <script>
+            window.frameCount = 0;
+            function tick() { window.frameCount++; requestAnimationFrame(tick); }
+            requestAnimationFrame(tick);
+          </script>
+        </head>
         <body>
           <button id="bridge-target" onclick="this.textContent = 'Clicked'">Bridge target</button>
           <label for="typing-target">Typing target</label>
@@ -219,6 +263,67 @@ async function closeServer(server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
+// browser_logs must report what the server answered: a 404 may not look like a 200.
+async function verifyNetworkLogsReportStatus(client) {
+  const server = createServer((request, response) => {
+    response.writeHead(request.url === "/missing" ? 404 : 200, {
+      "content-type": "text/html; charset=utf-8",
+    });
+    response.end("<!doctype html><title>Status page</title><h1>Status page heading</h1>");
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert(address && typeof address !== "string", "Status page did not bind a TCP port");
+  let browserId = null;
+  try {
+    const created = await callBrowserTool(client, "browser_new_tab", {
+      url: `http://127.0.0.1:${address.port}/`,
+    });
+    browserId = created.browserId;
+    assert(
+      typeof browserId === "string",
+      "browser_new_tab returned no browserId for the status page",
+    );
+    await callBrowserTool(client, "browser_wait", {
+      browserId,
+      text: "Status page heading",
+      timeoutMs: 15_000,
+    });
+    const fetched = await callBrowserTool(client, "browser_evaluate", {
+      browserId,
+      function:
+        "async () => { const response = await fetch('/missing'); await response.text(); return response.status; }",
+    });
+    assert(
+      JSON.parse(fetched.resultJson) === 404,
+      `The status page did not answer 404: ${fetched.resultJson}`,
+    );
+    // The browser records a request's timing entry a moment after the response completes.
+    const deadline = Date.now() + 5_000;
+    let seen = [];
+    while (Date.now() < deadline) {
+      const logs = await callBrowserTool(client, "browser_logs", { browserId });
+      seen = logs.network.map((entry) => ({
+        pathname: new URL(entry.url).pathname,
+        status: entry.status ?? null,
+      }));
+      const reported = (pathname, status) =>
+        seen.some((entry) => entry.pathname === pathname && entry.status === status);
+      if (reported("/missing", 404) && reported("/", 200)) return;
+      await delay(100);
+    }
+    throw new Error(
+      `browser_logs did not report 404 for /missing and 200 for the page: ${JSON.stringify(seen)}`,
+    );
+  } finally {
+    if (browserId) await callBrowserTool(client, "browser_close_tab", { browserId });
+    await closeServer(server);
+  }
+}
+
 function mcpPayload(result, command) {
   const payload = result.structuredContent;
   assert(
@@ -233,18 +338,84 @@ async function callBrowserTool(client, name, args = {}) {
   return mcpPayload(await client.callTool({ name, args }), name);
 }
 
-async function callBrowserToolUntilReady(client, name, args = {}) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const result = await client.callTool({ name, args });
-    const payload = result.structuredContent;
-    if (payload?.ok === true) return payload.result;
-    if (payload?.ok !== false || payload.error?.retryable !== true) {
-      return mcpPayload(result, name);
-    }
-    await delay(100);
+async function connectBrowserToolClient(daemonPort, callerAgentId) {
+  const transport = new StreamableHTTPClientTransport(
+    new URL(
+      `http://127.0.0.1:${daemonPort}/mcp/agents?callerAgentId=${encodeURIComponent(callerAgentId)}`,
+    ),
+  );
+  return experimental_createMCPClient({ transport });
+}
+
+async function openBrowserWorkspace(page, workspaceKey) {
+  await page.getByTestId(`sidebar-workspace-row-${workspaceKey}`).click({ timeout: timeoutMs });
+  await expect(page.getByTestId(`workspace-deck-entry-${workspaceKey}`)).toBeVisible();
+}
+
+async function openSecondDesktopWindow(page) {
+  const nextWindow = page.context().waitForEvent("page", { timeout: timeoutMs });
+  await page.evaluate(() => window.paseoDesktop.window.openNew());
+  return nextWindow;
+}
+
+async function listBrowserHosts(client) {
+  const reply = await client.callTool({ name: "browser_list_hosts", args: {} });
+  assert(Array.isArray(reply.structuredContent?.browserHosts), JSON.stringify(reply));
+  return reply.structuredContent.browserHosts;
+}
+
+async function expectBrowserHostNameInCommandCenter(page, name) {
+  await page.getByTestId("sidebar-search").click();
+  const search = page.getByTestId("command-center-input");
+  await search.fill("Copy browser host name");
+  const action = page.getByRole("button", { name: /Copy browser host name/ });
+  await expect(action).toContainText(name);
+  await action.click();
+  await expect(search).toBeHidden();
+  await expect(page.getByText("Copied", { exact: true })).toBeVisible();
+}
+
+async function verifyBrowserHostRouting({ page, client, targetUrl, workspaceKey }) {
+  await openBrowserWorkspace(page, workspaceKey);
+  await expect.poll(async () => (await listBrowserHosts(client)).length).toBe(1);
+  const [firstHost] = await listBrowserHosts(client);
+  await expectBrowserHostNameInCommandCenter(page, firstHost.label);
+  const secondWindow = await openSecondDesktopWindow(page);
+
+  try {
+    await openBrowserWorkspace(secondWindow, workspaceKey);
+    await expect.poll(async () => (await listBrowserHosts(client)).length).toBe(2);
+    const secondHost = (await listBrowserHosts(client)).find(
+      (host) => host.browserHostId !== firstHost.browserHostId,
+    );
+    assert(secondHost?.label && secondHost.label !== firstHost.label, "Windows share a host label");
+    await expectBrowserHostNameInCommandCenter(secondWindow, secondHost.label);
+
+    const ambiguous = await client.callTool({ name: "browser_new_tab", args: { url: targetUrl } });
+    expect(ambiguous.structuredContent).toMatchObject({
+      ok: false,
+      error: { code: "browser_host_ambiguous", browserHosts: [firstHost, secondHost] },
+    });
+    expect((await callBrowserTool(client, "browser_list_tabs")).tabs).toEqual([]);
+
+    const { browserId, browserHost } = await callBrowserTool(client, "browser_new_tab", {
+      url: targetUrl,
+      browserHostId: firstHost.browserHostId,
+    });
+    expect(browserHost).toEqual(firstHost);
+    // Only the tab's test ID carries the exact ID returned by the agent tool.
+    await expect(page.getByTestId(`workspace-tab-browser_${browserId}`)).toBeVisible();
+    await expect(secondWindow.getByTestId(`workspace-tab-browser_${browserId}`)).toHaveCount(0);
+    expect((await callBrowserTool(client, "browser_list_tabs")).tabs).toMatchObject([
+      { browserId, browserHost: firstHost, isActive: false },
+    ]);
+    await callBrowserTool(client, "browser_wait", { browserId, text: "Bridge target" });
+    await callBrowserTool(client, "browser_close_tab", { browserId });
+  } finally {
+    await secondWindow.close();
   }
-  throw new Error(`${name} remained unavailable for ${timeoutMs}ms`);
+
+  await expect.poll(() => listBrowserHosts(client)).toEqual([firstHost]);
 }
 
 async function waitForGuestSelector(client, browserId) {
@@ -277,7 +448,66 @@ async function waitForGuestActiveElement(client, browserId, elementId) {
   return false;
 }
 
-async function createCallerAgent(daemonPort) {
+// A wait whose condition never matches must say which condition expired, not blame the host.
+async function verifyExpiredWaitNamesItsCondition(client, targetUrl) {
+  const created = await callBrowserTool(client, "browser_new_tab", { url: targetUrl });
+  const browserId = created.browserId;
+  assert(typeof browserId === "string", "browser_new_tab returned no browserId for the wait page");
+  try {
+    await callBrowserTool(client, "browser_wait", { browserId, text: "Bridge target" });
+    // The page title is not body text, so this wait expires.
+    const response = await client.callTool({
+      name: "browser_wait",
+      args: { browserId, text: "Desktop browser target", timeoutMs: 1_000 },
+    });
+    const text = response.content?.[0]?.text;
+    assert(
+      response.structuredContent?.ok === false &&
+        text === "Timed out waiting for browser text: Desktop browser target",
+      `browser_wait did not name its expired condition: ${JSON.stringify(response.content)}`,
+    );
+  } finally {
+    await callBrowserTool(client, "browser_close_tab", { browserId });
+  }
+}
+
+// A page whose Content Security Policy omits 'unsafe-eval' refuses eval(); the tools must still work.
+async function verifyEvaluateOnPageWithoutUnsafeEval(client, targetUrl) {
+  const created = await callBrowserTool(client, "browser_new_tab", {
+    url: new URL(CSP_PAGE_PATH, targetUrl).href,
+  });
+  const browserId = created.browserId;
+  assert(typeof browserId === "string", "browser_new_tab returned no browserId for the CSP page");
+  try {
+    await callBrowserTool(client, "browser_wait", {
+      browserId,
+      text: "CSP page heading",
+      timeoutMs: 15_000,
+    });
+    const title = await callBrowserTool(client, "browser_evaluate", {
+      browserId,
+      function: "() => document.title",
+    });
+    assert(
+      JSON.parse(title.resultJson) === "CSP page",
+      `browser_evaluate on a page without 'unsafe-eval' returned ${title.resultJson}`,
+    );
+    // The control: the page itself really does refuse eval().
+    const probe = await callBrowserTool(client, "browser_evaluate", {
+      browserId,
+      function:
+        '() => { try { (0, eval)("1"); return "eval allowed"; } catch (error) { return error.message; } }',
+    });
+    assert(
+      /Content Security Policy/.test(JSON.parse(probe.resultJson)),
+      `The CSP page did not refuse eval(): ${probe.resultJson}`,
+    );
+  } finally {
+    await callBrowserTool(client, "browser_close_tab", { browserId });
+  }
+}
+
+async function createCallerAgent(daemonPort, workspaceId = workspaceIds[0]) {
   const transport = new StreamableHTTPClientTransport(
     new URL(`http://127.0.0.1:${daemonPort}/mcp/agents`),
   );
@@ -287,12 +517,11 @@ async function createCallerAgent(daemonPort) {
       name: "create_agent",
       args: {
         relationship: { kind: "detached" },
-        workspace: { kind: "existing", workspaceId: workspaceIds[0] },
+        workspace: { kind: "existing", workspaceId },
         title: "Browser desktop browser E2E caller",
         provider: "mock/ten-second-stream",
         settings: { modeId: "load-test" },
         initialPrompt: "Remain available while the browser bridge regression runs.",
-        background: true,
       },
     });
     const result = response.structuredContent;
@@ -302,7 +531,7 @@ async function createCallerAgent(daemonPort) {
     );
     assert(typeof result.agentId === "string", "create_agent returned no caller agent id");
     assert(
-      result.workspaceId === workspaceIds[0],
+      result.workspaceId === workspaceId,
       `MCP caller attached to unexpected workspace ${result.workspaceId}`,
     );
     return result.agentId;
@@ -366,7 +595,8 @@ async function readPresentation(page, browserId) {
 async function readViewport(client, browserId) {
   const evaluated = await callBrowserTool(client, "browser_evaluate", {
     browserId,
-    function: "() => ({ width: window.innerWidth, height: window.innerHeight })",
+    function:
+      "() => ({ width: window.innerWidth, height: window.innerHeight, scale: window.devicePixelRatio })",
   });
   return JSON.parse(evaluated.resultJson);
 }
@@ -383,17 +613,12 @@ async function clickGuestElement(page, client, browserId, selector) {
   });
   const elementRect = JSON.parse(evaluated.resultJson);
   assert(elementRect, `Guest element ${selector} was unavailable`);
-  const webviewRect = await page.evaluate((id) => {
-    const webview = document.querySelector(`[data-paseo-browser-id="${id}"]`);
-    if (!(webview instanceof HTMLElement)) return null;
-    const rect = webview.getBoundingClientRect();
-    return { x: rect.x, y: rect.y };
-  }, browserId);
-  assert(webviewRect, `Browser webview ${browserId} was unavailable`);
-  await page.mouse.click(
-    webviewRect.x + elementRect.x + elementRect.width / 2,
-    webviewRect.y + elementRect.y + elementRect.height / 2,
-  );
+  await page.locator(`[data-paseo-browser-id="${browserId}"]`).click({
+    position: {
+      x: elementRect.x + elementRect.width / 2,
+      y: elementRect.y + elementRect.height / 2,
+    },
+  });
 }
 
 async function selectDeviceSize(page, label) {
@@ -464,7 +689,191 @@ function recordViewportMismatch(failures, label, actual, expected) {
   );
 }
 
-async function runRegression({ page, client, serverId, targetUrl, callerAgentId, artifactDir }) {
+async function evaluateDesktopWindow(inspectorPort, expression) {
+  const [target] = await (await fetch(`http://127.0.0.1:${inspectorPort}/json/list`)).json();
+  const socket = new WebSocket(target.webSocketDebuggerUrl);
+  try {
+    return await new Promise((resolve, reject) => {
+      socket.addEventListener("error", reject, { once: true });
+      socket.addEventListener("message", ({ data }) => {
+        const response = JSON.parse(data);
+        if (response.id !== 1) return;
+        if (response.error || response.result?.exceptionDetails) reject(new Error(data));
+        else resolve(response.result.result.value);
+      });
+      socket.addEventListener(
+        "open",
+        () =>
+          socket.send(
+            JSON.stringify({
+              id: 1,
+              method: "Runtime.evaluate",
+              params: {
+                expression: `(() => { const win = process.mainModule.require('electron').BrowserWindow.getAllWindows().find(win => win.webContents.getURL().includes('localhost:')); ${expression} })()`,
+                returnByValue: true,
+              },
+            }),
+          ),
+        { once: true },
+      );
+    });
+  } finally {
+    socket.close();
+  }
+}
+
+async function setWindowHidden(inspectorPort, hidden) {
+  await evaluateDesktopWindow(
+    inspectorPort,
+    `win.${hidden ? "hide" : "show"}(); if (win.isVisible() !== ${!hidden}) throw new Error('Window visibility did not change');`,
+  );
+}
+
+async function resizeDesktopWindow(inspectorPort, { width, height }) {
+  return evaluateDesktopWindow(
+    inspectorPort,
+    `const [width, height] = win.getContentSize(); win.setContentSize(${width}, ${height}); return { width, height };`,
+  );
+}
+
+async function verifyHiddenBrowserScreenshots({
+  page,
+  client,
+  browserId,
+  artifactDir,
+  inspectorPort,
+}) {
+  const readFrames = async () => {
+    const result = await callBrowserTool(client, "browser_evaluate", {
+      browserId,
+      function: "() => window.frameCount",
+    });
+    return JSON.parse(result.resultJson);
+  };
+  const expectAnimation = async () => {
+    const start = await readFrames();
+    assert(typeof start === "number", "Animation fixture was not loaded");
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if ((await readFrames()) > start + 2) return;
+      await delay(50);
+    }
+    throw new Error("Browser did not animate in the restored window");
+  };
+  const measurements = [];
+  const expectIdle = async (label) => {
+    await delay(500); // Let Chromium consume the visibility change before sampling.
+    const start = await readFrames();
+    await delay(1_000); // A fixed sampling interval is the behavior under test.
+    const frames = (await readFrames()) - start;
+    measurements.push({ label, frames });
+    writeJson(path.join(artifactDir, "hidden-browser-frames.json"), measurements);
+    assert(frames === 0, `${label}: hidden browser produced ${frames} animation frames`);
+  };
+  try {
+    await expectAnimation();
+    await setWindowHidden(inspectorPort, true);
+    await expectIdle("before-capture");
+    await callBrowserTool(client, "browser_evaluate", {
+      browserId,
+      function: "() => { document.body.style.background = 'rgb(0,255,0)'; }",
+    });
+    const response = await client.callTool({ name: "browser_screenshot", args: { browserId } });
+    mcpPayload(response, "browser_screenshot");
+    const screenshot = response.content.find((item) => item.type === "image");
+    assert(screenshot, "browser_screenshot returned no image");
+    fs.writeFileSync(
+      path.join(artifactDir, "hidden-browser-viewport.png"),
+      Buffer.from(screenshot.data, "base64"),
+    );
+    const pixel = await page.evaluate(async (base64) => {
+      const image = new Image();
+      image.src = `data:image/png;base64,${base64}`;
+      await image.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = image.width;
+      canvas.height = image.height;
+      const context = canvas.getContext("2d");
+      context.drawImage(image, 0, 0);
+      return [
+        ...context.getImageData(Math.floor(image.width / 2), Math.floor(image.height / 2), 1, 1)
+          .data,
+      ];
+    }, screenshot.data);
+    assert(
+      JSON.stringify(pixel) === "[0,255,0,255]",
+      `Hidden screenshot returned stale pixels: ${pixel}`,
+    );
+    await expectIdle("after-capture");
+  } finally {
+    await setWindowHidden(inspectorPort, false);
+  }
+  await expectAnimation();
+}
+
+async function verifyBackgroundTypingStaysInGuest({ page, client, serverId, browserId, agent }) {
+  await page
+    .getByTestId(`workspace-deck-entry-${serverId}:${agent.workspaceId}`)
+    .getByTestId(`workspace-tab-agent_${agent.agentId}`)
+    .click({ timeout: timeoutMs });
+  const composer = page
+    .getByRole("textbox", { name: "Message agent..." })
+    .filter({ visible: true })
+    .first();
+  const draft = "draft the user is typing";
+  await composer.click();
+  await composer.pressSequentially(draft);
+  assert(
+    await composer.evaluate((element) => element === document.activeElement),
+    "Composer did not keep focus while the user typed",
+  );
+
+  const snapshot = await callBrowserTool(client, "browser_snapshot", { browserId });
+  const ref = snapshot.snapshot.match(/textbox "Typing target" \[ref=(@e\d+)\]/)?.[1];
+  assert(ref, `browser_snapshot did not expose the typing target: ${snapshot.snapshot}`);
+  await callBrowserTool(client, "browser_type", { browserId, ref, text: "agent text" });
+  await callBrowserTool(client, "browser_keypress", { browserId, ref, key: "!" });
+
+  // The user keeps typing in the composer while the agent types into the tab's focused field.
+  await composer.click();
+  await composer.press("End");
+  assert(
+    await composer.evaluate((element) => element === document.activeElement),
+    "Composer did not take focus back from the browser tab",
+  );
+  await callBrowserTool(client, "browser_type", { browserId, text: " more" });
+  await callBrowserTool(client, "browser_keypress", { browserId, key: "?" });
+
+  const guestValue = JSON.parse(
+    (
+      await callBrowserTool(client, "browser_evaluate", {
+        browserId,
+        function: "() => document.getElementById('typing-target').value",
+      })
+    ).resultJson,
+  );
+  const composerValue = await composer.inputValue();
+  assert(
+    composerValue === draft,
+    `browser_type and browser_keypress in a background tab changed the focused composer: ${JSON.stringify(composerValue)}`,
+  );
+  assert(
+    guestValue === "agent text! more?",
+    `browser_type and browser_keypress did not reach the browser tab: ${JSON.stringify(guestValue)}`,
+  );
+  await composer.fill("");
+}
+
+async function runRegression({
+  page,
+  client,
+  serverId,
+  targetUrl,
+  callerAgentId,
+  typingAgent,
+  artifactDir,
+  inspectorPort,
+}) {
   const failures = [];
   const originalWorkspaceId = workspaceIds[0];
   const originalWorkspaceRow = page.getByTestId(
@@ -483,6 +892,10 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
     document.body.appendChild(overlayRoot);
   });
 
+  await verifyReactFormFill((name, args) => callBrowserTool(client, name, args), targetUrl);
+  await verifyEvaluateOnPageWithoutUnsafeEval(client, targetUrl);
+  await verifyExpiredWaitNamesItsCondition(client, targetUrl);
+
   const created = await callBrowserTool(client, "browser_new_tab", { url: targetUrl });
   const browserId = created.browserId;
   assert(typeof browserId === "string", "browser_new_tab returned no browserId");
@@ -492,7 +905,10 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
   await page.waitForFunction(
     (id) => {
       const webview = document.querySelector(`[data-paseo-browser-id="${id}"]`);
-      return webview && webview.parentElement?.id !== "paseo-browser-resident-webviews";
+      const surface = webview?.parentElement;
+      return (
+        surface?.getAttribute("aria-hidden") === "false" && surface.style.pointerEvents === "auto"
+      );
     },
     browserId,
     { timeout: timeoutMs },
@@ -519,10 +935,11 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
 
   const deviceSizeMenuPainted = await selectDeviceSize(page, "iPhone SE · 375×667");
   assert(deviceSizeMenuPainted, "Device size menu did not paint above the browser surface");
+  const deviceViewport = await readViewport(client, browserId);
   recordViewportMismatch(
     failures,
     "device size menu paints and receives input above the browser surface",
-    await readViewport(client, browserId),
+    deviceViewport,
     { width: 375, height: 667 },
   );
 
@@ -531,6 +948,12 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
     text: "Bridge target",
     timeoutMs: 5_000,
   });
+  const resizedScreenshot = await callBrowserTool(client, "browser_screenshot", { browserId });
+  assert(
+    resizedScreenshot.width === Math.round(375 * deviceViewport.scale) &&
+      resizedScreenshot.height === Math.round(667 * deviceViewport.scale),
+    `Screenshot after resize returned ${resizedScreenshot.width}×${resizedScreenshot.height}`,
+  );
   const requestedViewport = { width: 640, height: 480 };
   await callBrowserTool(client, "browser_resize", { browserId, ...requestedViewport });
   recordViewportMismatch(
@@ -606,7 +1029,7 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
     { timeout: timeoutMs },
   );
   try {
-    await callBrowserToolUntilReady(client, "browser_screenshot", { browserId });
+    await callBrowserTool(client, "browser_screenshot", { browserId });
   } catch (error) {
     failures.push(`inactive browser remains captureable: ${String(error)}`);
   }
@@ -719,6 +1142,8 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
   const parkedGuest = await readGuest(page, browserId);
   assert(parkedGuest, "Browser guest was not parked after workspace eviction");
 
+  await verifyHiddenBrowserScreenshots({ page, client, browserId, artifactDir, inspectorPort });
+
   const listed = await callBrowserTool(client, "browser_list_tabs");
   assert(
     listed.tabs.some((tab) => tab.browserId === browserId),
@@ -738,6 +1163,13 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
     browserId,
     text: "Clicked",
     timeoutMs: 5_000,
+  });
+  await verifyBackgroundTypingStaysInGuest({
+    page,
+    client,
+    serverId,
+    browserId,
+    agent: typingAgent,
   });
 
   await originalWorkspaceRow.click();
@@ -809,6 +1241,7 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
     JSON.parse(readyStateResult.resultJson) === "complete",
     "Local browser document did not finish loading",
   );
+  await verifyNetworkLogsReportStatus(client);
   // Reproduce the report's mismatch: the guest is complete, but the pane's
   // last loading signal says it is not ready.
   await page.evaluate((id) => {
@@ -845,6 +1278,10 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
   await page.screenshot({ path: path.join(artifactDir, "local-page-screenshot-selector.png") });
   await originalDeck.getByRole("button", { name: "Cancel element selector" }).click();
 
+  // This journey selects tabs from both pane rails. Keep both columns above the compact-header
+  // breakpoint; narrow panes deliberately replace their rail with a tab dropdown.
+  await resizeDesktopWindow(inspectorPort, { width: 1920, height: 1080 });
+  await page.waitForFunction(() => innerWidth >= 1920, null, { timeout: timeoutMs });
   await originalDeck.getByTestId(`workspace-tab-agent_${callerAgentId}`).click();
   await page.getByTestId("sidebar-search").click();
   await page.getByTestId("command-center-input").fill("Split pane right");
@@ -886,10 +1323,12 @@ async function runRegression({ page, client, serverId, targetUrl, callerAgentId,
     guestFocus: "passed",
     overlayPlane: "passed",
     inactiveCapture: "passed",
+    hiddenWindowCapture: "passed",
     list: "passed",
     snapshot: "passed",
     click: "passed",
     localPageSelectors: "passed",
+    evaluateWithoutUnsafeEval: "passed",
   };
 }
 
@@ -904,7 +1343,9 @@ async function main() {
   const workspaceRoot = path.join(runtimeDir, "workspaces");
   fs.mkdirSync(paseoHome, { recursive: true });
 
-  const [daemonPort, expoPort, cdpPort] = await Promise.all([
+  const [daemonPort, expoPort, cdpPort, inspectorPort, remotePort] = await Promise.all([
+    reservePort(),
+    reservePort(),
     reservePort(),
     reservePort(),
     reservePort(),
@@ -912,13 +1353,28 @@ async function main() {
   const listen = `127.0.0.1:${daemonPort}`;
   seedPaseoHome(paseoHome, listen, workspaceRoot);
   const target = await startTargetPage();
+  seedPluginLinks(paseoHome, workspaceIds[0], target.url, workspaceIds[1]);
+  const remoteHome = path.join(runtimeDir, "remote-home");
+  seedPaseoHome(remoteHome, `127.0.0.1:${remotePort}`, path.join(runtimeDir, "remote-workspaces"));
   const children = [];
   let browser = null;
   let client = null;
 
   try {
+    // Observe the real Electron shell handoff without launching a user's browser.
+    const openerDirectory = path.join(runtimeDir, "url-handler");
+    const externalOpenLog = path.join(artifactDir, "external-opens.txt");
+    fs.mkdirSync(openerDirectory, { recursive: true });
+    fs.writeFileSync(externalOpenLog, "");
+    fs.writeFileSync(
+      path.join(openerDirectory, "xdg-open"),
+      '#!/bin/sh\nprintf "%s\\n" "$1" >> "$PASEO_TEST_EXTERNAL_OPEN_LOG"\n',
+      { mode: 0o755 },
+    );
     const commonEnv = {
       ...process.env,
+      PATH: `${openerDirectory}${path.delimiter}${process.env.PATH}`,
+      PASEO_TEST_EXTERNAL_OPEN_LOG: externalOpenLog,
       PASEO_HOME: paseoHome,
       PASEO_LISTEN: listen,
       PASEO_DAEMON_ENDPOINT: `localhost:${daemonPort}`,
@@ -939,9 +1395,29 @@ async function main() {
     children.push(daemon.child);
     await waitForPort(daemonPort, "daemon", daemon);
 
+    const remoteDaemon = spawnLogged(
+      "remote-daemon",
+      process.execPath,
+      ["--import", "tsx", path.join(rootDir, "packages/server/scripts/dev-runner.ts")],
+      {
+        cwd: rootDir,
+        env: {
+          ...commonEnv,
+          PASEO_HOME: remoteHome,
+          PASEO_LISTEN: `127.0.0.1:${remotePort}`,
+          PASEO_SERVER_ID: "plugin-links-remote",
+          PASEO_NODE_ENV: "development",
+        },
+      },
+      artifactDir,
+    );
+    children.push(remoteDaemon.child);
+    await waitForPort(remotePort, "remote daemon", remoteDaemon);
+
     const desktopArgs = [
       process.execPath,
       devRunner,
+      `--inspect=127.0.0.1:${inspectorPort}`,
       ...(process.platform === "linux" ? ["--no-sandbox"] : []),
     ];
     const desktopCommand = process.platform === "linux" ? "xvfb-run" : desktopArgs.shift();
@@ -957,6 +1433,7 @@ async function main() {
         cwd: rootDir,
         env: {
           ...commonEnv,
+          EXPO_UNSTABLE_HEADLESS: "1",
           EXPO_PORT: String(expoPort),
           EXPO_DEV_URL: `http://localhost:${expoPort}`,
           PASEO_ELECTRON_REMOTE_DEBUGGING_PORT: String(cdpPort),
@@ -971,8 +1448,34 @@ async function main() {
 
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
     const page = await waitForAppPage(browser, expoPort);
+    await hideDeveloperToasts(page);
     const status = await waitForDesktopStatus(page);
+    await settleDesktopStartup(page);
 
+    const checkPluginLinks = () =>
+      runPluginLinksRegression({
+        page,
+        remotePort,
+        workspaceId: workspaceIds[0],
+        remoteWorkspaceId: workspaceIds[1],
+        url: target.url,
+        artifactDir,
+        externalOpenLog: process.platform === "linux" ? externalOpenLog : null,
+      });
+    if (process.env.PASEO_DESKTOP_PLUGIN_LINKS_ONLY === "1") {
+      const pluginLinks = await checkPluginLinks();
+      writeJson(path.join(artifactDir, "result.json"), { pluginLinks });
+      console.log("Plugin external links and workspace browser passed.");
+      return;
+    }
+    const settingsScroll = await runSettingsScrollRegression(page, (size) =>
+      resizeDesktopWindow(inspectorPort, size),
+    );
+    if (process.env.PASEO_DESKTOP_SETTINGS_SCROLL_ONLY === "1") {
+      writeJson(path.join(artifactDir, "result.json"), { settingsScroll });
+      console.log("Desktop Settings scroll regression passed.");
+      return;
+    }
     const settingsMemory = await runSettingsMemoryRegression(page);
     if (process.env.PASEO_DESKTOP_SETTINGS_MEMORY_ONLY === "1") {
       writeJson(path.join(artifactDir, "result.json"), { settingsMemory });
@@ -982,24 +1485,44 @@ async function main() {
       return;
     }
 
+    const adaptiveTheme = await runAdaptiveThemeRegression(artifactDir);
     await runAppearanceFontSizeRegression(page);
 
     const callerAgentId = await createCallerAgent(daemonPort);
-    const transport = new StreamableHTTPClientTransport(
-      new URL(
-        `http://127.0.0.1:${daemonPort}/mcp/agents?callerAgentId=${encodeURIComponent(callerAgentId)}`,
-      ),
-    );
-    client = await experimental_createMCPClient({ transport });
+    const typingAgent = {
+      workspaceId: workspaceIds.at(-1),
+      agentId: await createCallerAgent(daemonPort, workspaceIds.at(-1)),
+    };
+    client = await connectBrowserToolClient(daemonPort, callerAgentId);
     const report = await runRegression({
       page,
       client,
       serverId: status.serverId,
       targetUrl: target.url,
+      inspectorPort,
       callerAgentId,
+      typingAgent,
       artifactDir,
     });
-    writeJson(path.join(artifactDir, "result.json"), { ...report, settingsMemory });
+    const pluginLinks = await checkPluginLinks();
+    const routingClient = await connectBrowserToolClient(daemonPort, typingAgent.agentId);
+    try {
+      await verifyBrowserHostRouting({
+        page,
+        client: routingClient,
+        targetUrl: target.url,
+        workspaceKey: `${status.serverId}:${typingAgent.workspaceId}`,
+      });
+    } finally {
+      await routingClient.close();
+    }
+    writeJson(path.join(artifactDir, "result.json"), {
+      ...report,
+      settingsMemory,
+      pluginLinks,
+      adaptiveTheme,
+      browserHostRouting: "passed",
+    });
     console.log(
       `Browser desktop browser E2E passed: WebContents ${report.originalWebContentsId} remained ${report.finalWebContentsId}; viewport, inactive capture, focus continuity, list, snapshot, click, local-page selectors passed.`,
     );

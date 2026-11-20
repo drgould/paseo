@@ -1,4 +1,5 @@
 import type pino from "pino";
+import type { SessionDelivery } from "../owned-subscriptions/index.js";
 import { isAbsolute } from "node:path";
 import { getErrorMessage } from "@getpaseo/protocol/error-utils";
 import { getForgeDefinitionOrNeutral } from "@getpaseo/protocol/forge-manifest";
@@ -10,6 +11,7 @@ import type {
   CheckoutRefreshRequest,
   CheckoutRenameBranchRequest,
   CheckoutStatusRequest,
+  CheckoutWorktreesListRequest,
   SessionInboundMessage,
   SessionOutboundMessage,
   SubscribeCheckoutDiffRequest,
@@ -50,10 +52,10 @@ import {
   pullCurrentBranch,
   pushCurrentBranch,
   listCheckoutCommits,
-  getCommitFileDiff,
 } from "../../../utils/checkout-git.js";
 import { runGitCommand } from "../../../utils/run-git-command.js";
 import { expandTilde } from "../../../utils/path.js";
+import { listGitWorktrees } from "../../../utils/worktree.js";
 import type { GitMetadataGenerator } from "./git-metadata-generator.js";
 
 /**
@@ -108,11 +110,15 @@ function toLegacyGithubSearchItems(items: ForgeSearchResultItem[]): LegacyGithub
  * real CheckoutDiffManager satisfies this structurally; tests supply a fake.
  */
 export interface CheckoutDiffSubscriber {
+  readCommitFile: import("../../diff/index.js").DiffSubscriptions["readCommitFile"];
+  read(
+    params: Omit<CheckoutDiffSubscriptionRequest, "signal">,
+  ): Promise<CheckoutDiffSnapshotPayload>;
   subscribe(
     params: CheckoutDiffSubscriptionRequest,
     listener: (snapshot: CheckoutDiffSnapshotPayload) => void,
   ): Promise<CheckoutDiffSubscription>;
-  scheduleRefreshForCwd(cwd: string): void;
+  scheduleRefreshForCwd(cwd: string): Promise<void>;
 }
 
 export interface CheckoutSessionOptions {
@@ -152,7 +158,6 @@ export class CheckoutSession {
   private readonly paseoHome: string;
   private readonly worktreesRoot: string | undefined;
   private readonly logger: pino.Logger;
-  private readonly diffSubscriptions = new Map<string, () => void>();
   private readonly statusUpdateFingerprints = new Map<string, string>();
 
   constructor(options: CheckoutSessionOptions) {
@@ -271,7 +276,10 @@ export class CheckoutSession {
     const { cwd, requestId } = msg;
 
     try {
-      const { baseRef, commits } = await listCheckoutCommits({ cwd: expandTilde(cwd) });
+      const { baseRef, commits } = await listCheckoutCommits({
+        cwd: expandTilde(cwd),
+        context: { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
+      });
       this.host.emit({
         type: "checkout.commits.list.response",
         payload: { cwd, baseRef, commits, error: null, requestId },
@@ -284,7 +292,27 @@ export class CheckoutSession {
     }
   }
 
-  async handleCommitFileDiffRequest(msg: CheckoutCommitFileDiffRequest): Promise<void> {
+  async handleWorktreesListRequest(msg: CheckoutWorktreesListRequest): Promise<void> {
+    const { cwd, requestId } = msg;
+
+    try {
+      const worktrees = await listGitWorktrees({ cwd: expandTilde(cwd) });
+      this.host.emit({
+        type: "checkout.worktrees.list.response",
+        payload: { cwd, worktrees, error: null, requestId },
+      });
+    } catch (error) {
+      this.host.emit({
+        type: "checkout.worktrees.list.response",
+        payload: { cwd, worktrees: [], error: toCheckoutError(error), requestId },
+      });
+    }
+  }
+
+  async handleCommitFileDiffRequest(
+    msg: CheckoutCommitFileDiffRequest,
+    signal: AbortSignal,
+  ): Promise<void> {
     const { cwd, sha, path, requestId } = msg;
 
     try {
@@ -292,7 +320,12 @@ export class CheckoutSession {
       if (path.length === 0 || isAbsolute(path) || path.split(/[\\/]/).includes("..")) {
         throw new Error(`Invalid path: ${path}`);
       }
-      const file = await getCommitFileDiff({ cwd: expandTilde(cwd), sha, path });
+      const file = await this.checkoutDiffManager.readCommitFile({
+        cwd: expandTilde(cwd),
+        sha,
+        path,
+        signal,
+      });
       this.host.emit({
         type: "checkout.commits.file_diff.response",
         payload: { cwd, sha, path, file, error: null, requestId },
@@ -370,13 +403,14 @@ export class CheckoutSession {
   }
 
   async handleBranchSuggestionsRequest(msg: BranchSuggestionsRequest): Promise<void> {
-    const { cwd, query, limit, requestId } = msg;
+    const { cwd, query, limit, refMode, requestId } = msg;
 
     try {
       const resolvedCwd = expandTilde(cwd);
       const branchDetails = await this.workspaceGitService.suggestBranchesForCwd(resolvedCwd, {
         query,
         limit,
+        refMode,
       });
       this.host.emit({
         type: "branch_suggestions_response",
@@ -400,48 +434,77 @@ export class CheckoutSession {
     }
   }
 
-  async handleSubscribeDiffRequest(msg: SubscribeCheckoutDiffRequest): Promise<void> {
-    const cwd = expandTilde(msg.cwd);
-    this.diffSubscriptions.get(msg.subscriptionId)?.();
-    const abort = new AbortController();
-    const unsubscribe = () => abort.abort();
-    this.diffSubscriptions.set(msg.subscriptionId, unsubscribe);
+  async handleReadDiffRequest(
+    msg: Extract<SessionInboundMessage, { type: "checkout.diff.get.request" }>,
+  ): Promise<void> {
+    const snapshot = await this.checkoutDiffManager.read({
+      cwd: expandTilde(msg.cwd),
+      compare: msg.compare,
+    });
+    this.host.emit({
+      type: "checkout.diff.get.response",
+      payload: { ...snapshot, requestId: msg.requestId },
+    });
+  }
 
+  async handleSubscribeDiffRequest(
+    msg: SubscribeCheckoutDiffRequest,
+    ownership: SessionDelivery,
+  ): Promise<void> {
+    let bootstrap: Promise<CheckoutDiffSubscription> | undefined;
+    const owner = ownership.begin(
+      "diffs",
+      msg.subscriptionId,
+      async () => {
+        await bootstrap?.then(
+          (subscription) => subscription.unsubscribe(),
+          () => undefined,
+        );
+      },
+      `diff:${msg.subscriptionId}`,
+    );
+    let ready = false;
+    let pending: CheckoutDiffSnapshotPayload | null = null;
+    const emitSnapshot = (snapshot: CheckoutDiffSnapshotPayload) =>
+      owner.emit({
+        type: "checkout_diff_update",
+        payload: { ...snapshot, subscriptionId: owner.responseId },
+      });
     try {
-      const subscription = await this.checkoutDiffManager.subscribe(
-        { cwd, compare: msg.compare, signal: abort.signal },
+      bootstrap = this.checkoutDiffManager.subscribe(
+        { cwd: expandTilde(msg.cwd), compare: msg.compare, signal: owner.signal },
         (snapshot) => {
-          this.host.emit({
-            type: "checkout_diff_update",
-            payload: {
-              subscriptionId: msg.subscriptionId,
-              ...snapshot,
-            },
-          });
+          if (owner.signal.aborted) return;
+          if (ready) emitSnapshot(snapshot);
+          else pending = snapshot;
         },
       );
-
+      const subscription = await bootstrap;
+      if (owner.signal.aborted) {
+        subscription.unsubscribe();
+        return;
+      }
       this.host.emit({
         type: "subscribe_checkout_diff_response",
         payload: {
-          subscriptionId: msg.subscriptionId,
           ...subscription.initial,
+          subscriptionId: owner.responseId,
           requestId: msg.requestId,
         },
       });
+      ready = true;
+      if (pending) emitSnapshot(pending);
     } catch (error) {
-      if (this.diffSubscriptions.get(msg.subscriptionId) === unsubscribe) {
-        this.diffSubscriptions.delete(msg.subscriptionId);
-      }
-      unsubscribe();
+      await owner.release();
       throw error;
     }
   }
 
-  handleUnsubscribeDiffRequest(msg: UnsubscribeCheckoutDiffRequest): void {
-    const unsubscribe = this.diffSubscriptions.get(msg.subscriptionId);
-    this.diffSubscriptions.delete(msg.subscriptionId);
-    unsubscribe?.();
+  async handleUnsubscribeDiffRequest(
+    msg: UnsubscribeCheckoutDiffRequest,
+    ownership: SessionDelivery,
+  ): Promise<void> {
+    await ownership.release(msg.subscriptionId);
   }
 
   async handleRefreshRequest(msg: CheckoutRefreshRequest): Promise<void> {
@@ -455,7 +518,7 @@ export class CheckoutSession {
         includeForge: true,
         reason: "manual-refresh",
       });
-      this.checkoutDiffManager.scheduleRefreshForCwd(resolvedCwd);
+      await this.checkoutDiffManager.scheduleRefreshForCwd(resolvedCwd);
       this.host.emit({
         type: "checkout.refresh.response",
         payload: {
@@ -509,8 +572,8 @@ export class CheckoutSession {
    * Notify the live diff subscriptions that the working tree at `cwd` changed.
    * Called by the command handlers below after they mutate the repository.
    */
-  private scheduleDiffRefresh(cwd: string): void {
-    this.checkoutDiffManager.scheduleRefreshForCwd(cwd);
+  private scheduleDiffRefresh(cwd: string): Promise<void> {
+    return this.checkoutDiffManager.scheduleRefreshForCwd(cwd);
   }
 
   // ---------------------------------------------------------------------------
@@ -524,7 +587,7 @@ export class CheckoutSession {
 
     try {
       const checkoutResult = await this.gitMutation.checkoutExistingBranch(cwd, branch);
-      this.scheduleDiffRefresh(cwd);
+      await this.scheduleDiffRefresh(cwd);
 
       // Push a workspace_update immediately so the sidebar/header reflect
       // the new branch name without waiting for the background git watcher.
@@ -576,7 +639,7 @@ export class CheckoutSession {
     try {
       const result = await this.host.renameCurrentBranch(cwd, branch);
       await this.gitMutation.notifyGitMutation(cwd, "rename-branch", { invalidateForge: true });
-      this.scheduleDiffRefresh(cwd);
+      await this.scheduleDiffRefresh(cwd);
       this.host.handleWorkspaceGitBranchSnapshot(cwd, result.currentBranch);
 
       // Branch is a git fact derived per-descriptor from each workspace's own
@@ -618,7 +681,7 @@ export class CheckoutSession {
     try {
       await discardChanges(cwd, paths);
       await this.gitMutation.notifyGitMutation(cwd, "discard-changes");
-      this.scheduleDiffRefresh(cwd);
+      await this.scheduleDiffRefresh(cwd);
       this.host.emit({
         type: "checkout.discard_changes.response",
         payload: { cwd, success: true, error: null, requestId },
@@ -645,7 +708,7 @@ export class CheckoutSession {
         timeout: 120_000,
       });
       await this.gitMutation.notifyGitMutation(cwd, "stash-push");
-      this.scheduleDiffRefresh(cwd);
+      await this.scheduleDiffRefresh(cwd);
       this.host.emit({
         type: "stash_save_response",
         payload: { cwd, success: true, error: null, requestId },
@@ -668,7 +731,7 @@ export class CheckoutSession {
         timeout: 120_000,
       });
       await this.gitMutation.notifyGitMutation(cwd, "stash-pop");
-      this.scheduleDiffRefresh(cwd);
+      await this.scheduleDiffRefresh(cwd);
       this.host.emit({
         type: "stash_pop_response",
         payload: { cwd, success: true, error: null, requestId },
@@ -720,7 +783,7 @@ export class CheckoutSession {
         addAll: msg.addAll ?? true,
       });
       await this.gitMutation.notifyGitMutation(cwd, "commit-changes");
-      this.scheduleDiffRefresh(cwd);
+      await this.scheduleDiffRefresh(cwd);
 
       this.host.emit({
         type: "checkout_commit_response",
@@ -781,7 +844,7 @@ export class CheckoutSession {
         this.gitMutation.notifyGitMutation(mutatedCwd, "merge-to-base", { invalidateForge: true }),
         ...(mutatedCwd !== cwd ? [this.gitMutation.notifyGitMutation(cwd, "merge-to-base")] : []),
       ]);
-      this.scheduleDiffRefresh(cwd);
+      await this.scheduleDiffRefresh(cwd);
 
       this.host.emit({
         type: "checkout_merge_response",
@@ -818,12 +881,16 @@ export class CheckoutSession {
         }
       }
 
-      await mergeFromBase(cwd, {
-        baseRef: msg.baseRef,
-        requireCleanTarget: msg.requireCleanTarget ?? true,
-      });
+      await mergeFromBase(
+        cwd,
+        {
+          baseRef: msg.baseRef,
+          requireCleanTarget: msg.requireCleanTarget ?? true,
+        },
+        { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
+      );
       await this.gitMutation.notifyGitMutation(cwd, "merge-from-base", { invalidateForge: true });
-      this.scheduleDiffRefresh(cwd);
+      await this.scheduleDiffRefresh(cwd);
 
       this.host.emit({
         type: "checkout_merge_from_base_response",
@@ -855,7 +922,7 @@ export class CheckoutSession {
     try {
       await pullCurrentBranch(cwd);
       await this.gitMutation.notifyGitMutation(cwd, "pull", { invalidateForge: true });
-      this.scheduleDiffRefresh(cwd);
+      await this.scheduleDiffRefresh(cwd);
 
       this.host.emit({
         type: "checkout_pull_response",
@@ -933,6 +1000,7 @@ export class CheckoutSession {
           base: msg.baseRef,
         },
         service,
+        { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
       );
       await this.gitMutation.notifyGitMutation(cwd, "create-pr", { invalidateForge: true });
 
@@ -1413,10 +1481,6 @@ export class CheckoutSession {
   }
 
   cleanup(): void {
-    for (const unsubscribe of this.diffSubscriptions.values()) {
-      unsubscribe();
-    }
-    this.diffSubscriptions.clear();
     this.statusUpdateFingerprints.clear();
   }
 }
